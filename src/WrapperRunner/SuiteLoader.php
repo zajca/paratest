@@ -7,6 +7,7 @@ namespace ParaTest\WrapperRunner;
 use Generator;
 use ParaTest\Options;
 use PHPUnit\Event\Facade as EventFacade;
+use PHPUnit\Framework\ExecutionOrderDependency;
 use PHPUnit\Framework\Test;
 use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\TestSuite;
@@ -33,7 +34,9 @@ use Symfony\Component\Console\Output\OutputInterface;
 use function array_filter;
 use function array_keys;
 use function array_merge;
+use function array_pop;
 use function array_slice;
+use function array_unique;
 use function array_values;
 use function assert;
 use function ceil;
@@ -57,6 +60,24 @@ final readonly class SuiteLoader
     public int $testCount;
     /** @var list<non-empty-string> */
     public array $tests;
+
+    /**
+     * Transitive `@depends` ancestor map for every `TestCase` encountered during
+     * suite loading. Keys are `"Class::method"`; values are flat ancestor lists
+     * (not just direct deps — closure computed in {@see buildDependsMap()}).
+     *
+     * Consumed by `FailedTestExtractor` to expand a failed test's retry work-item
+     * set with its `@depends` ancestors so PHPUnit does not mark them
+     * `"This test depends on X::Y to pass"` skipped on retry.
+     *
+     * Populated by Pass 1 (`loadFiles()` iteration collects direct edges) + Pass 2
+     * (`buildDependsMap()` iterative DFS with memoization + cycle guard).
+     *
+     * See `docs/retry-feature-design.md` §2.4.
+     *
+     * @var array<string, list<string>>
+     */
+    public array $dependsMap;
 
     public function __construct(
         private Options $options,
@@ -128,33 +149,70 @@ final readonly class SuiteLoader
 
         $this->testCount = count($testSuite);
 
-        $files = [];
-        $tests = [];
+        $files      = [];
+        $tests      = [];
+        /** @var array<string, list<string>> $directDeps */
+        $directDeps = [];
+        /** @var array<string, bool> $knownKeys */
+        $knownKeys  = [];
         foreach ($this->loadFiles($testSuite) as $file => $test) {
             $files[$file] = null;
 
             if ($test instanceof PhptTestCase) {
                 $tests[] = $file;
-            } else {
-                $name = $test->name();
-                if ($test->providedData() !== []) {
-                    $dataName = $test->dataName();
-                    if ($this->options->functional) {
-                        $name = sprintf('/%s%s$/', preg_quote($name, '/'), preg_quote($test->dataSetAsString(), '/'));
-                    } else {
-                        if (is_int($dataName)) {
-                            $name .= '#' . $dataName;
-                        } else {
-                            $name .= '@' . $dataName;
-                        }
-                    }
+                continue;
+            }
+
+            $name = $test->name();
+            if ($test->providedData() !== []) {
+                $dataName = $test->dataName();
+                if ($this->options->functional) {
+                    $name = sprintf('/%s%s$/', preg_quote($name, '/'), preg_quote($test->dataSetAsString(), '/'));
                 } else {
-                    $name = sprintf('/%s$/', $name);
+                    if (is_int($dataName)) {
+                        $name .= '#' . $dataName;
+                    } else {
+                        $name .= '@' . $dataName;
+                    }
+                }
+            } else {
+                $name = sprintf('/%s$/', $name);
+            }
+
+            $tests[] = "$file\0$name";
+
+            // Pass 1 — direct `@depends` edges. See docs/retry-feature-design.md §2.4.
+            // Key = "Class::method" of the dependent test. PHPT and `DataProviderTestSuite`
+            // nodes are skipped above / traversed by loadFiles; they don't participate in @depends.
+            $key             = $test::class . '::' . $test->name();
+            $knownKeys[$key] = true;
+            $edges           = [];
+            foreach ($test->requires() as $dependency) {
+                if (! $dependency->isValid()) {
+                    continue;
                 }
 
-                $tests[] = "$file\0$name";
+                // Plain "Class::method" dep (#[Depends], #[DependsUsingDeepClone],
+                // #[DependsUsingShallowClone] are all surfaced the same way here —
+                // clone strategy is handled by PHPUnit internally at run time).
+                if (! $dependency->targetIsClass()) {
+                    $edges[] = $dependency->getTarget();
+                    continue;
+                }
+
+                // #[DependsOnClass] — placeholder; resolved in Pass 2 by expanding
+                // to all known "$className::..." keys in $directDeps.
+                $edges[] = '::' . $dependency->getTargetClassName();
             }
+
+            if ($edges === []) {
+                continue;
+            }
+
+            $directDeps[$key] = $edges;
         }
+
+        $this->dependsMap = $this->buildDependsMap($directDeps, $knownKeys);
 
         $this->tests = $this->options->functional
             ? $tests
@@ -210,6 +268,124 @@ final readonly class SuiteLoader
                 continue;
             }
         }
+    }
+
+    /**
+     * Pass 2 — compute the transitive closure of `@depends` ancestors for every
+     * test key that declared at least one direct dep.
+     *
+     * Uses iterative DFS with an explicit stack (recursion would risk stack
+     * overflow on long `@depends` chains). Memoizes visited nodes across
+     * overlapping subgraphs; cycles (PHPUnit already rejects them but we guard
+     * defensively) are broken by marking a node `in-progress` and ignoring
+     * back-edges.
+     *
+     * `#[DependsOnClass]` placeholders emitted by Pass 1 in the form
+     * `"::ClassName"` are expanded here to every known key with a matching
+     * `"ClassName::"` prefix.
+     *
+     * See docs/retry-feature-design.md §2.4.
+     *
+     * @param array<string, list<string>> $directDeps
+     * @param array<string, bool>         $knownKeys
+     *
+     * @return array<string, list<string>>
+     */
+    private function buildDependsMap(array $directDeps, array $knownKeys): array
+    {
+        // Expand #[DependsOnClass] placeholders into concrete edges.
+        $expanded = [];
+        foreach ($directDeps as $key => $edges) {
+            $resolved = [];
+            foreach ($edges as $edge) {
+                if (str_starts_with($edge, '::')) {
+                    $className = substr($edge, 2);
+                    $prefix    = $className . '::';
+                    foreach (array_keys($knownKeys) as $knownKey) {
+                        if (! str_starts_with($knownKey, $prefix)) {
+                            continue;
+                        }
+
+                        if ($knownKey === $key) {
+                            // Never depend on self.
+                            continue;
+                        }
+
+                        $resolved[] = $knownKey;
+                    }
+
+                    continue;
+                }
+
+                $resolved[] = $edge;
+            }
+
+            $expanded[$key] = array_values(array_unique($resolved));
+        }
+
+        $result = [];
+        /** @var array<string, int> $state 0 = unvisited, 1 = in-progress, 2 = done */
+        $state = [];
+
+        foreach (array_keys($expanded) as $startKey) {
+            if (isset($result[$startKey])) {
+                continue;
+            }
+
+            // Iterative DFS: stack entries carry (currentKey, iteratorIndex, ancestors-so-far).
+            /** @var list<array{0: string, 1: int, 2: list<string>}> $stack */
+            $stack          = [[$startKey, 0, []]];
+            $state[$startKey] = 1;
+
+            while ($stack !== []) {
+                $top      = &$stack[count($stack) - 1];
+                $key      = $top[0];
+                $idx      = $top[1];
+                $children = $expanded[$key] ?? [];
+
+                if ($idx >= count($children)) {
+                    // All children explored — compute this node's ancestor set.
+                    $acc = [];
+                    foreach ($children as $child) {
+                        $acc[] = $child;
+                        foreach ($result[$child] ?? [] as $grand) {
+                            $acc[] = $grand;
+                        }
+                    }
+
+                    $result[$key] = array_values(array_unique($acc));
+                    $state[$key]  = 2;
+                    unset($top);
+                    array_pop($stack);
+                    continue;
+                }
+
+                $child      = $children[$idx];
+                $top[1]     = $idx + 1;
+                unset($top);
+
+                if (isset($result[$child])) {
+                    continue;
+                }
+
+                if (($state[$child] ?? 0) === 1) {
+                    // Cycle — defensive guard; PHPUnit itself rejects these.
+                    continue;
+                }
+
+                if (! isset($expanded[$child])) {
+                    // Leaf dep (no further deps) — record empty ancestor set and move on.
+                    $result[$child] = [];
+                    $state[$child]  = 2;
+                    continue;
+                }
+
+                $state[$child] = 1;
+                $stack[]       = [$child, 0, []];
+            }
+        }
+
+        return $result;
     }
 
     /**

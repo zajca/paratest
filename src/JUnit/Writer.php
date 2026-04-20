@@ -93,6 +93,10 @@ final readonly class Writer
         $caseNode->setAttribute('assertions', (string) $case->assertions);
         $caseNode->setAttribute('time', sprintf('%F', $case->time));
 
+        if ($case instanceof TestCaseWithRetries) {
+            $caseNode->setAttribute('retries', (string) $case->retries);
+        }
+
         if ($case instanceof TestCaseWithMessage) {
             if ($case->xmlTagName === MessageType::skipped) {
                 $defectNode = $this->document->createElement($case->xmlTagName->toString());
@@ -107,6 +111,43 @@ final readonly class Writer
             $caseNode->appendChild($defectNode);
         }
 
+        if ($case instanceof TestCaseWithRetries) {
+            foreach ($case->priorAttemptFailures as $priorFailure) {
+                $retryNode = $this->createRetryChildNode($priorFailure, $case->finalAttemptPassed);
+                if ($retryNode === null) {
+                    continue;
+                }
+
+                $caseNode->appendChild($retryNode);
+            }
+        }
+
         return $caseNode;
+    }
+
+    /**
+     * Builds a Surefire-convention child element (<flakyFailure>, <flakyError>,
+     * <rerunFailure>, <rerunError>) for one prior-attempt failure. Returns null
+     * when the prior-attempt payload is not a retryable defect (e.g., skipped).
+     */
+    private function createRetryChildNode(TestCaseWithMessage $priorFailure, bool $finalAttemptPassed): ?DOMElement
+    {
+        $elementName = match ($priorFailure->xmlTagName) {
+            MessageType::failure => $finalAttemptPassed ? 'flakyFailure' : 'rerunFailure',
+            MessageType::error   => $finalAttemptPassed ? 'flakyError' : 'rerunError',
+            MessageType::skipped => null,
+        };
+
+        if ($elementName === null) {
+            return null;
+        }
+
+        $node = $this->document->createElement($elementName, htmlspecialchars($priorFailure->text, ENT_XML1));
+        $type = $priorFailure->type;
+        if ($type !== null) {
+            $node->setAttribute('type', $type);
+        }
+
+        return $node;
     }
 }

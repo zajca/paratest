@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ParaTest\Tests\Unit;
 
 use InvalidArgumentException;
+use ParaTest\JUnit\MessageType;
 use ParaTest\Options;
 use ParaTest\Tests\TestBase;
 use ParaTest\WrapperRunner\ShardDistribution;
@@ -318,5 +319,90 @@ final class OptionsTest extends TestBase
         $options = $this->createOptionsFromArgv([], __DIR__);
 
         self::assertSame(0, $options->shardDistributionSeed);
+    }
+
+    public function testRetryDefaultIsZero(): void
+    {
+        $options = $this->createOptionsFromArgv([], __DIR__);
+
+        self::assertSame(0, $options->retry);
+    }
+
+    /** @return iterable<string, list<int>> */
+    public static function provideValidRetryValues(): iterable
+    {
+        yield 'zero' => [0];
+        yield 'ten'  => [10];
+    }
+
+    #[DataProvider('provideValidRetryValues')]
+    public function testRetryAcceptsValidRange(int $value): void
+    {
+        $options = $this->createOptionsFromArgv(['--retry' => (string) $value], __DIR__);
+
+        self::assertSame($value, $options->retry);
+    }
+
+    public function testRetryRejectsNegative(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('--retry must be between 0 and 10');
+
+        $this->createOptionsFromArgv(['--retry' => '-1'], __DIR__);
+    }
+
+    public function testRetryRejectsAboveMaximum(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('--retry must be between 0 and 10');
+
+        $this->createOptionsFromArgv(['--retry' => '11'], __DIR__);
+    }
+
+    public function testRetryOnDefaultIsFailureAndError(): void
+    {
+        $options = $this->createOptionsFromArgv([], __DIR__);
+
+        self::assertContains(MessageType::failure, $options->retryOn);
+        self::assertContains(MessageType::error, $options->retryOn);
+        self::assertCount(2, $options->retryOn);
+    }
+
+    public function testRetryOnAcceptsSkipped(): void
+    {
+        $options = $this->createOptionsFromArgv(['--retry-on' => 'skipped'], __DIR__);
+
+        self::assertSame([MessageType::skipped], $options->retryOn);
+    }
+
+    public function testRetryOnRejectsCrash(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('reserved');
+
+        $this->createOptionsFromArgv(['--retry-on' => 'crash'], __DIR__);
+    }
+
+    public function testRetryOnRejectsUnknownToken(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('Invalid --retry-on value');
+
+        $this->createOptionsFromArgv(['--retry-on' => 'banana'], __DIR__);
+    }
+
+    public function testRetryOnRejectsEmptyWhenRetryPositive(): void
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('--retry-on must not be empty when --retry > 0');
+
+        $this->createOptionsFromArgv(['--retry' => '1', '--retry-on' => ''], __DIR__);
+    }
+
+    public function testJunitRetryMetadataDefaultsToFalse(): void
+    {
+        $options = $this->createOptionsFromArgv([], __DIR__);
+
+        self::assertFalse($options->junitRetryMetadata);
     }
 }

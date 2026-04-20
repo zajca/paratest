@@ -21,6 +21,7 @@ use Symfony\Component\Console\Formatter\OutputFormatter;
 use Symfony\Component\Console\Output\OutputInterface;
 
 use function assert;
+use function count;
 use function fclose;
 use function feof;
 use function floor;
@@ -52,6 +53,18 @@ final class ResultPrinter
     private $teamcityLogFileHandle;
     /** @var array<non-empty-string, int> */
     private array $tailPositions;
+
+    /**
+     * H1 — when `--teamcity` (stdout) is combined with `--retry>0`, intermediate
+     * attempts' TeamCity events would otherwise stream to stdout twice (once
+     * during attempt 1, again during the retry), confusing IDE parsers that do
+     * not tolerate duplicate `testStarted` for the same test name.
+     * Toggled on by `WrapperRunner::runAttempt()` for non-final attempts;
+     * final-attempt events are streamed normally.
+     *
+     * See docs/retry-feature-devils-advocate.md H1.
+     */
+    private bool $suppressTeamcityStdout = false;
 
     public function __construct(
         private readonly OutputInterface $output,
@@ -87,6 +100,16 @@ final class ResultPrinter
     public function setTestCount(int $testCount): void
     {
         $this->totalCases = $testCount;
+    }
+
+    /**
+     * Controls whether live TeamCity (stdout) events are emitted during
+     * {@see self::printFeedback()}. See {@see $suppressTeamcityStdout} and
+     * docs/retry-feature-devils-advocate.md H1.
+     */
+    public function setSuppressTeamcityStdout(bool $suppress): void
+    {
+        $this->suppressTeamcityStdout = $suppress;
     }
 
     public function start(): void
@@ -154,7 +177,9 @@ final class ResultPrinter
 
         if ($this->options->configuration->outputIsTeamCity()) {
             assert(isset($teamcityProgress));
-            $this->output->write($teamcityProgress);
+            if (! $this->suppressTeamcityStdout) {
+                $this->output->write($teamcityProgress);
+            }
 
             return;
         }
@@ -182,9 +207,14 @@ final class ResultPrinter
     /**
      * @param list<SplFileInfo>                                $teamcityFiles
      * @param array<class-string, TestDoxTestResultCollection> $testdoxResults
+     * @param list<string>                                     $flakyTests `"Class::method"` entries; only read when `--retry>0`.
      */
-    public function printResults(TestResult $testResult, array $teamcityFiles, array $testdoxResults): void
-    {
+    public function printResults(
+        TestResult $testResult,
+        array $teamcityFiles,
+        array $testdoxResults,
+        array $flakyTests = [],
+    ): void {
         if ($this->options->needsTeamcity) {
             $teamcityProgress = $this->tailMultiple($teamcityFiles);
 
@@ -256,6 +286,25 @@ final class ResultPrinter
             $this->printer,
             $this->options->configuration->colors(),
         ))->print($testResult);
+
+        // R4 — Flaky tests summary. Emitted only when --retry>0 so output is
+        // bit-identical to pre-retry behavior on the default (retry=0) path.
+        // See docs/retry-feature-design.md §R4.
+        if ($this->options->retry <= 0) {
+            return;
+        }
+
+        $flakyCount = count($flakyTests);
+        if ($flakyCount === 0) {
+            $this->printer->print('Flaky tests (0): none.' . PHP_EOL);
+
+            return;
+        }
+
+        $this->printer->print(sprintf('Flaky tests (%d):%s', $flakyCount, PHP_EOL));
+        foreach ($flakyTests as $flakyTest) {
+            $this->printer->print(sprintf('  - %s%s', $flakyTest, PHP_EOL));
+        }
     }
 
     /** @param non-empty-string $item */

@@ -4,16 +4,19 @@ declare(strict_types=1);
 
 namespace ParaTest\WrapperRunner;
 
+use ParaTest\JUnit\FailedTestExtractor;
 use ParaTest\JUnit\LogMerger;
 use ParaTest\JUnit\Writer;
 use ParaTest\Options;
 use ParaTest\RunnerInterface;
 use ParaTest\TestDox\TestDoxResultsMerger;
+use PHPUnit\Framework\TestStatus\TestStatus;
 use PHPUnit\Logging\TestDox\HtmlRenderer as TestDoxHtmlRenderer;
 use PHPUnit\Logging\TestDox\PlainTextRenderer as TestDoxPlainTextRenderer;
 use PHPUnit\Logging\TestDox\TestResultCollection as TestDoxTestResultCollection;
 use PHPUnit\Runner\CodeCoverage;
 use PHPUnit\Runner\ResultCache\DefaultResultCache;
+use PHPUnit\Runner\ResultCache\ResultCacheId;
 use PHPUnit\TestRunner\TestResult\Facade as TestResultFacade;
 use PHPUnit\TestRunner\TestResult\TestResult;
 use PHPUnit\TextUI\Configuration\CodeCoverageFilterRegistry;
@@ -37,12 +40,16 @@ use function array_shift;
 use function assert;
 use function count;
 use function dirname;
+use function end;
+use function explode;
 use function file_get_contents;
 use function filesize;
+use function is_a;
 use function is_file;
 use function max;
 use function preg_match;
 use function realpath;
+use function str_contains;
 use function str_starts_with;
 use function unlink;
 use function unserialize;
@@ -56,6 +63,10 @@ final class WrapperRunner implements RunnerInterface
     private const int CYCLE_SLEEP = 10000;
     private readonly ResultPrinter $printer;
 
+    // ------------------------------------------------------------------
+    // Per-attempt fields — cleared and re-populated at the start/end of
+    // every `runAttempt()` call. Snapshots are captured into `AttemptOutcome`.
+    // ------------------------------------------------------------------
     /** @var list<non-empty-string> */
     private array $pending = [];
     private int $exitcode  = -1;
@@ -63,10 +74,6 @@ final class WrapperRunner implements RunnerInterface
     private array $workers = [];
     /** @var array<int,int> */
     private array $batches = [];
-    /** @var array<non-empty-string,true> */
-    private array $requiredTestResultFiles = [];
-    /** @var array<non-empty-string,true> */
-    private array $requiredCoverageFiles = [];
 
     /** @var list<SplFileInfo> */
     private array $statusFiles = [];
@@ -86,6 +93,17 @@ final class WrapperRunner implements RunnerInterface
     private array $teamcityFiles = [];
     /** @var list<SplFileInfo> */
     private array $testdoxFiles = [];
+
+    // ------------------------------------------------------------------
+    // Cross-attempt fields — accumulate across every attempt so coverage
+    // union (R6) and `requiredTestResultFiles`/`requiredCoverageFiles`
+    // sanity checks cover the whole run, not just the final attempt.
+    // ------------------------------------------------------------------
+    /** @var array<non-empty-string,true> */
+    private array $requiredTestResultFiles = [];
+    /** @var array<non-empty-string,true> */
+    private array $requiredCoverageFiles = [];
+
     /** @var array<non-empty-string> */
     private readonly array $parameters;
     private CodeCoverageFilterRegistry $codeCoverageFilterRegistry;
@@ -129,16 +147,161 @@ final class WrapperRunner implements RunnerInterface
             $this->output,
             $this->codeCoverageFilterRegistry,
         );
-        $result      = TestResultFacade::result();
 
-        $this->pending = $suiteLoader->tests;
         $this->printer->setTestCount($suiteLoader->testCount);
         $this->printer->start();
+
+        // H4 — `--stop-on-*` takes priority over `--retry`. Warn and disable retry.
+        // See docs/retry-feature-devils-advocate.md H4.
+        $effectiveRetry = $this->options->retry;
+        if ($effectiveRetry > 0 && $this->isAnyStopOnFlagSet()) {
+            $this->output->writeln(
+                '<comment>Warning: --retry is disabled because --stop-on-* is set.</comment>',
+            );
+            $effectiveRetry = 0;
+        }
+
+        if ($effectiveRetry === 0) {
+            // Fast path: single attempt, no orchestrator. Preserves bit-identical
+            // behavior against pre-refactor baseline (design §2.8).
+            $outcome = $this->runAttempt(1, $suiteLoader->tests);
+
+            return $this->complete([$outcome], null);
+        }
+
+        // `retryOn` is validated non-empty when `retry > 0` in Options::fromConsoleInput(),
+        // but the property type is `list<MessageType>`. Re-assert here so phpstan can
+        // narrow and the Dev B extractor contract's `non-empty-list` input is respected.
+        $retryOn = $this->options->retryOn;
+        assert($retryOn !== []);
+
+        $extractor   = new FailedTestExtractor(
+            $retryOn,
+            $suiteLoader->dependsMap,
+            $this->options->functional,
+        );
+        $orchestrator = new RetryOrchestrator(
+            $this->options,
+            $this->output,
+            $suiteLoader,
+            $extractor,
+        );
+
+        $maxAttempts = $effectiveRetry + 1;
+        $retryResult = $orchestrator->orchestrate(
+            $suiteLoader->tests,
+            function (int $attempt, array $pending) use ($maxAttempts): AttemptOutcome {
+                // H1 — intermediate-attempt TeamCity stdout events would confuse
+                // IDE parsers. Suppress live stdout emission for all attempts
+                // except the final one; the final attempt's events stream
+                // normally and printResults() replays accumulated final-attempt
+                // events from their tmp file afterwards.
+                $this->printer->setSuppressTeamcityStdout($attempt < $maxAttempts);
+
+                return $this->runAttempt($attempt, $pending);
+            },
+        );
+
+        // Ensure stdout is re-enabled for the final printResults() replay.
+        $this->printer->setSuppressTeamcityStdout(false);
+
+        return $this->complete($retryResult->allAttempts, $retryResult);
+    }
+
+    /**
+     * Executes a single attempt: start worker pool, distribute `$pending`,
+     * wait for completion, snapshot this attempt's per-attempt accumulators
+     * into an {@see AttemptOutcome}, and clear them for the next attempt.
+     *
+     * Cross-attempt fields (`requiredTestResultFiles`, `requiredCoverageFiles`)
+     * are deliberately NOT cleared — they accumulate so `complete()` can
+     * validate every attempt's workers wrote their artifacts and the coverage
+     * union (R6) sees every file.
+     *
+     * @param list<non-empty-string> $pending
+     */
+    private function runAttempt(int $attempt, array $pending): AttemptOutcome
+    {
+        // Reset per-attempt state. Cross-attempt bookkeeping is preserved.
+        $this->pending               = $pending;
+        $this->exitcode              = -1;
+        $this->workers               = [];
+        $this->batches               = [];
+        $this->statusFiles           = [];
+        $this->progressFiles         = [];
+        $this->unexpectedOutputFiles = [];
+        $this->resultCacheFiles      = [];
+        $this->testResultFiles       = [];
+        $this->coverageFiles         = [];
+        $this->junitFiles            = [];
+        $this->teamcityFiles         = [];
+        $this->testdoxFiles          = [];
+
         $this->startWorkers();
         $this->assignAllPendingTests();
         $this->waitForAllToFinish();
 
-        return $this->complete($result);
+        // Aggregate this attempt's per-worker TestResult files into a single
+        // `TestResult` — mirrors the first half of `complete()` but scoped to
+        // this attempt's files only. The final-attempt copy of this aggregate
+        // also flows into `complete()` as the primary test result.
+        $attemptTestResult = TestResultFacade::result();
+        foreach ($this->testResultFiles as $testresultFile) {
+            if (! $testresultFile->isFile()) {
+                continue;
+            }
+
+            $contents = file_get_contents($testresultFile->getPathname());
+            assert($contents !== false);
+            $workerResult = unserialize($contents);
+            assert($workerResult instanceof TestResult);
+
+            $attemptTestResult = $this->mergeTestResults($attemptTestResult, $workerResult);
+        }
+
+        $outcome = new AttemptOutcome(
+            $attempt,
+            $pending,
+            $this->junitFiles,
+            $this->coverageFiles,
+            $this->testResultFiles,
+            $this->testdoxFiles,
+            $this->teamcityFiles,
+            $this->resultCacheFiles,
+            $this->progressFiles,
+            $this->unexpectedOutputFiles,
+            $this->statusFiles,
+            $this->exitcode,
+            $attemptTestResult,
+        );
+
+        // Clear per-attempt arrays so the next attempt starts clean.
+        $this->statusFiles           = [];
+        $this->progressFiles         = [];
+        $this->unexpectedOutputFiles = [];
+        $this->resultCacheFiles      = [];
+        $this->testResultFiles       = [];
+        $this->coverageFiles         = [];
+        $this->junitFiles            = [];
+        $this->teamcityFiles         = [];
+        $this->testdoxFiles          = [];
+
+        return $outcome;
+    }
+
+    private function isAnyStopOnFlagSet(): bool
+    {
+        $configuration = $this->options->configuration;
+
+        return $configuration->stopOnDefect()
+            || $configuration->stopOnError()
+            || $configuration->stopOnFailure()
+            || $configuration->stopOnWarning()
+            || $configuration->stopOnRisky()
+            || $configuration->stopOnDeprecation()
+            || $configuration->stopOnNotice()
+            || $configuration->stopOnSkipped()
+            || $configuration->stopOnIncomplete();
     }
 
     private function startWorkers(): void
@@ -283,9 +446,22 @@ final class WrapperRunner implements RunnerInterface
         unset($this->workers[$token]);
     }
 
-    private function complete(TestResult $testResultSum): int
+    /**
+     * Aggregates every attempt's artifacts into final reports (coverage, JUnit,
+     * TestDox, TeamCity), computes the shell exit code, and cleans up tmp files.
+     *
+     * `$attempts` is the list of per-attempt snapshots. With retry=0 it is a
+     * single-element list and behavior is bit-identical to pre-refactor.
+     * With retry>0, coverage aggregates every attempt's files (R6); JUnit
+     * uses all attempts when `--junit-retry-metadata` is on and final-attempt
+     * only otherwise (R1); TestDox and TeamCity always read final-attempt only.
+     *
+     * @param list<AttemptOutcome> $attemptOutcomesInput
+     */
+    private function complete(array $attemptOutcomesInput, ?RetryResult $retryResult): int
     {
-        // Validate test result files for workers that executed tests
+        // Validate test result files for workers that executed tests (across
+        // every attempt — workers that crashed mid-attempt would be flagged here).
         $missingTestResultFiles = [];
         foreach ($this->requiredTestResultFiles as $filePath => $true) {
             if (is_file($filePath)) {
@@ -299,65 +475,83 @@ final class WrapperRunner implements RunnerInterface
             throw MissingResultsException::create($missingTestResultFiles, 'test_result');
         }
 
-        foreach ($this->testResultFiles as $testresultFile) {
-            if (! $testresultFile->isFile()) {
-                continue;
-            }
+        assert($attemptOutcomesInput !== []);
+        $finalAttempt = end($attemptOutcomesInput);
 
-            $contents = file_get_contents($testresultFile->getPathname());
-            assert($contents !== false);
-            $testResult = unserialize($contents);
-            assert($testResult instanceof TestResult);
+        // The final attempt's aggregate determines pass/fail — R2 "exit 0 iff
+        // last attempt passed". Issues from prior attempts are deliberately not
+        // summed in because a passed retry should not inherit attempt-1 errors.
+        $testResultSum = $finalAttempt->testResultAggregate;
 
-            $testResultSum = new TestResult(
-                (int) $testResultSum->hasTests() + (int) $testResult->hasTests(),
-                $testResultSum->numberOfTestsRun() + $testResult->numberOfTestsRun(),
-                $testResultSum->numberOfAssertions() + $testResult->numberOfAssertions(),
-                array_merge_recursive($testResultSum->testErroredEvents(), $testResult->testErroredEvents()),
-                array_merge_recursive($testResultSum->testFailedEvents(), $testResult->testFailedEvents()),
-                array_merge_recursive($testResultSum->testConsideredRiskyEvents(), $testResult->testConsideredRiskyEvents()),
-                array_merge_recursive($testResultSum->testSuiteSkippedEvents(), $testResult->testSuiteSkippedEvents()),
-                array_merge_recursive($testResultSum->testSkippedEvents(), $testResult->testSkippedEvents()),
-                array_merge_recursive($testResultSum->testMarkedIncompleteEvents(), $testResult->testMarkedIncompleteEvents()),
-                array_merge_recursive($testResultSum->testTriggeredPhpunitDeprecationEvents(), $testResult->testTriggeredPhpunitDeprecationEvents()),
-                array_merge_recursive($testResultSum->testTriggeredPhpunitErrorEvents(), $testResult->testTriggeredPhpunitErrorEvents()),
-                array_merge_recursive($testResultSum->testTriggeredPhpunitNoticeEvents(), $testResult->testTriggeredPhpunitNoticeEvents()),
-                array_merge_recursive($testResultSum->testTriggeredPhpunitWarningEvents(), $testResult->testTriggeredPhpunitWarningEvents()),
-                array_merge_recursive($testResultSum->testRunnerTriggeredDeprecationEvents(), $testResult->testRunnerTriggeredDeprecationEvents()),
-                array_merge_recursive($testResultSum->testRunnerTriggeredNoticeEvents(), $testResult->testRunnerTriggeredNoticeEvents()),
-                array_merge_recursive($testResultSum->testRunnerTriggeredWarningEvents(), $testResult->testRunnerTriggeredWarningEvents()),
-                array_merge_recursive($testResultSum->errors(), $testResult->errors()),
-                array_merge_recursive($testResultSum->deprecations(), $testResult->deprecations()),
-                array_merge_recursive($testResultSum->notices(), $testResult->notices()),
-                array_merge_recursive($testResultSum->warnings(), $testResult->warnings()),
-                array_merge_recursive($testResultSum->phpDeprecations(), $testResult->phpDeprecations()),
-                array_merge_recursive($testResultSum->phpNotices(), $testResult->phpNotices()),
-                array_merge_recursive($testResultSum->phpWarnings(), $testResult->phpWarnings()),
-                $testResultSum->numberOfIssuesIgnoredByBaseline() + $testResult->numberOfIssuesIgnoredByBaseline(),
-            );
-        }
+        // Replay the last attempt's per-worker test result files into the
+        // baseline TestResultFacade sum so this code path stays byte-identical
+        // to the pre-refactor behavior when retry=0 (there's only one attempt
+        // and its aggregate already reflects the worker files).
+        // For retry > 0, finalAttempt->testResultAggregate is the correct
+        // authoritative value since it was built from the final attempt's
+        // worker result files at runAttempt() time.
 
+        // Pool per-attempt result-cache files so cache-aware consumers
+        // (e.g., `--order-by=defects`) still see the final outcome.
         if ($this->options->configuration->cacheResult()) {
             $resultCacheSum = new DefaultResultCache($this->options->configuration->testResultCacheFile());
-            foreach ($this->resultCacheFiles as $resultCacheFile) {
-                $resultCache = new DefaultResultCache($resultCacheFile->getPathname());
-                $resultCache->load();
+            foreach ($attemptOutcomesInput as $attempt) {
+                foreach ($attempt->resultCacheFiles as $resultCacheFile) {
+                    if (! $resultCacheFile->isFile()) {
+                        continue;
+                    }
 
-                $resultCacheSum->mergeWith($resultCache);
+                    $resultCache = new DefaultResultCache($resultCacheFile->getPathname());
+                    $resultCache->load();
+
+                    $resultCacheSum->mergeWith($resultCache);
+                }
+            }
+
+            // H2 — tests that failed then passed (flaky) must be re-written as
+            // FAILURE in the cache so `--order-by=defects` prioritizes them on
+            // the next run. See docs/retry-feature-devils-advocate.md H2.
+            if ($retryResult !== null && $retryResult->flakyTests !== []) {
+                foreach ($retryResult->flakyTests as $flakyKey) {
+                    if (! str_contains($flakyKey, '::')) {
+                        continue;
+                    }
+
+                    [$class, $method] = explode('::', $flakyKey, 2);
+                    if ($class === '' || $method === '') {
+                        continue;
+                    }
+
+                    // `$class` came from parsed JUnit XML written by PHPUnit itself —
+                    // it is a real loaded test-case class name. We assert the
+                    // `class-string<TestCase>` contract with `is_a()` so phpstan is
+                    // satisfied and unexpected values (e.g. PHPT discriminator)
+                    // are skipped gracefully rather than poisoning the cache.
+                    if (! is_a($class, \PHPUnit\Framework\TestCase::class, true)) {
+                        continue;
+                    }
+
+                    $resultCacheSum->setStatus(
+                        ResultCacheId::fromTestClassAndMethodName($class, $method),
+                        TestStatus::failure('Flaky: failed at least once during --retry run'),
+                    );
+                }
             }
 
             $resultCacheSum->persist();
         }
 
-        $testdoxResults = (new TestDoxResultsMerger())->getResultsFromTestdoxFiles($this->testdoxFiles);
+        // TestDox — final attempt only. See design §3.6.
+        $testdoxResults = (new TestDoxResultsMerger())->getResultsFromTestdoxFiles($finalAttempt->testdoxFiles);
 
         $this->printer->printResults(
             $testResultSum,
-            $this->teamcityFiles,
+            $finalAttempt->teamcityFiles,
             $testdoxResults,
+            $retryResult !== null ? $retryResult->flakyTests : [],
         );
-        $this->generateCodeCoverageReports();
-        $this->generateJunitLog();
+        $this->generateCodeCoverageReports($attemptOutcomesInput);
+        $this->generateJunitLog($attemptOutcomesInput);
         $this->generateTestDoxLogs($testdoxResults);
 
         $exitcode = (new ShellExitCodeCalculator())->calculate(
@@ -365,23 +559,79 @@ final class WrapperRunner implements RunnerInterface
             $testResultSum,
         );
 
-        $this->clearFiles($this->statusFiles);
-        $this->clearFiles($this->progressFiles);
-        $this->clearFiles($this->unexpectedOutputFiles);
-        $this->clearFiles($this->testResultFiles);
-        $this->clearFiles($this->resultCacheFiles);
-        $this->clearFiles($this->coverageFiles);
-        $this->clearFiles($this->junitFiles);
-        $this->clearFiles($this->teamcityFiles);
-        $this->clearFiles($this->testdoxFiles);
+        // Clean up artifacts from every attempt (retry=0 → single attempt).
+        foreach ($attemptOutcomesInput as $attempt) {
+            $this->clearFiles($attempt->statusFiles);
+            $this->clearFiles($attempt->progressFiles);
+            $this->clearFiles($attempt->unexpectedOutputFiles);
+            $this->clearFiles($attempt->testResultFiles);
+            $this->clearFiles($attempt->resultCacheFiles);
+            $this->clearFiles($attempt->coverageFiles);
+            $this->clearFiles($attempt->junitFiles);
+            $this->clearFiles($attempt->teamcityFiles);
+            $this->clearFiles($attempt->testdoxFiles);
+        }
 
         return $exitcode;
     }
 
-    protected function generateCodeCoverageReports(): void
+    /**
+     * Merges two `TestResult` snapshots identically to the prior in-line
+     * aggregation in `complete()`. Extracted for reuse by `runAttempt()`.
+     */
+    private function mergeTestResults(TestResult $left, TestResult $right): TestResult
     {
-        if ($this->coverageFiles === []) {
+        return new TestResult(
+            (int) $left->hasTests() + (int) $right->hasTests(),
+            $left->numberOfTestsRun() + $right->numberOfTestsRun(),
+            $left->numberOfAssertions() + $right->numberOfAssertions(),
+            array_merge_recursive($left->testErroredEvents(), $right->testErroredEvents()),
+            array_merge_recursive($left->testFailedEvents(), $right->testFailedEvents()),
+            array_merge_recursive($left->testConsideredRiskyEvents(), $right->testConsideredRiskyEvents()),
+            array_merge_recursive($left->testSuiteSkippedEvents(), $right->testSuiteSkippedEvents()),
+            array_merge_recursive($left->testSkippedEvents(), $right->testSkippedEvents()),
+            array_merge_recursive($left->testMarkedIncompleteEvents(), $right->testMarkedIncompleteEvents()),
+            array_merge_recursive($left->testTriggeredPhpunitDeprecationEvents(), $right->testTriggeredPhpunitDeprecationEvents()),
+            array_merge_recursive($left->testTriggeredPhpunitErrorEvents(), $right->testTriggeredPhpunitErrorEvents()),
+            array_merge_recursive($left->testTriggeredPhpunitNoticeEvents(), $right->testTriggeredPhpunitNoticeEvents()),
+            array_merge_recursive($left->testTriggeredPhpunitWarningEvents(), $right->testTriggeredPhpunitWarningEvents()),
+            array_merge_recursive($left->testRunnerTriggeredDeprecationEvents(), $right->testRunnerTriggeredDeprecationEvents()),
+            array_merge_recursive($left->testRunnerTriggeredNoticeEvents(), $right->testRunnerTriggeredNoticeEvents()),
+            array_merge_recursive($left->testRunnerTriggeredWarningEvents(), $right->testRunnerTriggeredWarningEvents()),
+            array_merge_recursive($left->errors(), $right->errors()),
+            array_merge_recursive($left->deprecations(), $right->deprecations()),
+            array_merge_recursive($left->notices(), $right->notices()),
+            array_merge_recursive($left->warnings(), $right->warnings()),
+            array_merge_recursive($left->phpDeprecations(), $right->phpDeprecations()),
+            array_merge_recursive($left->phpNotices(), $right->phpNotices()),
+            array_merge_recursive($left->phpWarnings(), $right->phpWarnings()),
+            $left->numberOfIssuesIgnoredByBaseline() + $right->numberOfIssuesIgnoredByBaseline(),
+        );
+    }
+
+    /** @param list<AttemptOutcome> $attempts */
+    protected function generateCodeCoverageReports(array $attempts): void
+    {
+        // R6 — coverage is unioned across every attempt's coverage files.
+        // `Merger::merge()` handles multi-file merge natively.
+        $allCoverageFiles = [];
+        foreach ($attempts as $attempt) {
+            foreach ($attempt->coverageFiles as $file) {
+                $allCoverageFiles[] = $file;
+            }
+        }
+
+        if ($allCoverageFiles === []) {
             return;
+        }
+
+        // H6 — coverage union may inflate coverage with lines only exercised in
+        // failing attempts. Warn loudly.
+        if ($this->options->retry > 0) {
+            $this->output->writeln(
+                '<comment>Warning: --retry>0 produces union coverage; lines exercised only in failing '
+                . 'attempts appear covered.</comment>',
+            );
         }
 
         // Validate coverage files for workers that executed tests
@@ -406,7 +656,7 @@ final class WrapperRunner implements RunnerInterface
         );
         $coverageFiles      = array_map(static function (SplFileInfo $fileInfo): false|string {
             return $fileInfo->getRealPath();
-        }, $this->coverageFiles);
+        }, $allCoverageFiles);
         $coverageFiles      = array_filter($coverageFiles, static function (false|string $file): bool {
             return $file !== false;
         });
@@ -447,13 +697,38 @@ final class WrapperRunner implements RunnerInterface
             && preg_match('/^[A-Za-z]:[\\\\\\/]/', $path) !== 1;
     }
 
-    private function generateJunitLog(): void
+    /** @param list<AttemptOutcome> $attempts */
+    private function generateJunitLog(array $attempts): void
     {
-        if ($this->junitFiles === []) {
+        $finalAttempt = end($attempts);
+        assert($finalAttempt instanceof AttemptOutcome);
+
+        if ($finalAttempt->junitFiles === []) {
             return;
         }
 
-        $testSuite = (new LogMerger())->merge($this->junitFiles);
+        // R1 — with `--junit-retry-metadata` off, JUnit XML contains only the
+        // final attempt's data (bit-identical to pre-retry behavior). When on,
+        // cross-attempt Surefire-convention elements are emitted by
+        // `LogMerger::mergeAcrossAttempts()`.
+        $logMerger = new LogMerger();
+
+        if ($this->options->junitRetryMetadata && count($attempts) > 1) {
+            /** @var array<int, list<SplFileInfo>> $perAttemptJunitFiles */
+            $perAttemptJunitFiles = [];
+            foreach ($attempts as $attempt) {
+                if ($attempt->junitFiles === []) {
+                    continue;
+                }
+
+                $perAttemptJunitFiles[$attempt->attemptNumber] = $attempt->junitFiles;
+            }
+
+            $testSuite = $logMerger->mergeAcrossAttempts($perAttemptJunitFiles);
+        } else {
+            $testSuite = $logMerger->merge($finalAttempt->junitFiles);
+        }
+
         if ($testSuite === null) {
             return;
         }

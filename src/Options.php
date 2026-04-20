@@ -7,6 +7,7 @@ namespace ParaTest;
 use Fidry\CpuCoreCounter\CpuCoreCounter;
 use Fidry\CpuCoreCounter\NumberOfCpuCoreNotFound;
 use InvalidArgumentException;
+use ParaTest\JUnit\MessageType;
 use ParaTest\WrapperRunner\ShardDistribution;
 use PHPUnit\TextUI\Configuration\Builder;
 use PHPUnit\TextUI\Configuration\Configuration;
@@ -21,13 +22,18 @@ use function array_column;
 use function array_filter;
 use function array_intersect_key;
 use function array_key_exists;
+use function array_map;
 use function array_shift;
+use function array_unique;
+use function array_values;
 use function assert;
 use function count;
 use function dirname;
 use function escapeshellarg;
+use function explode;
 use function file_exists;
 use function implode;
+use function in_array;
 use function is_array;
 use function is_bool;
 use function is_numeric;
@@ -40,6 +46,7 @@ use function str_starts_with;
 use function strlen;
 use function substr;
 use function sys_get_temp_dir;
+use function trim;
 use function uniqid;
 use function unserialize;
 
@@ -56,6 +63,18 @@ final readonly class Options
 {
     public const string ENV_KEY_TOKEN        = 'TEST_TOKEN';
     public const string ENV_KEY_UNIQUE_TOKEN = 'UNIQUE_TEST_TOKEN';
+
+    /**
+     * Validation bound for `--retry`. Values greater than this are rejected during
+     * CLI parsing. See docs/retry-feature-design.md §R5.
+     */
+    public const int MAX_RETRY = 10;
+
+    /**
+     * Valid tokens accepted by `--retry-on`. `crash` is deliberately excluded — reserved
+     * for a future follow-up per R3 in docs/retry-feature-design.md.
+     */
+    private const array RETRY_ON_VALID_TOKENS = ['failure', 'error', 'skipped'];
 
     private const array OPTIONS_TO_KEEP_FOR_PHPUNIT_IN_WORKER = [
         'bootstrap' => true,
@@ -119,6 +138,7 @@ final readonly class Options
      * @param array<non-empty-string, non-empty-string|true|list<non-empty-string>> $phpunitOptions
      * @param non-empty-string                                                      $runner
      * @param non-empty-string                                                      $tmpDir
+     * @param list<MessageType>                                                     $retryOn
      */
     public function __construct(
         public Configuration $configuration,
@@ -137,6 +157,9 @@ final readonly class Options
         public int $totalShards,
         public ShardDistribution $shardDistribution,
         public int $shardDistributionSeed,
+        public int $retry,
+        public bool $junitRetryMetadata,
+        public array $retryOn,
     ) {
         $this->needsTeamcity = $configuration->outputIsTeamCity() || $configuration->hasLogfileTeamcity();
         $this->needsTestdox  = $configuration->outputIsTestDox() || $configuration->hasLogfileTestdoxText() || $configuration->hasLogfileTestdoxHtml();
@@ -253,6 +276,78 @@ final readonly class Options
             throw new InvalidArgumentException('Shard test distribution seed can only be used with random distribution');
         }
 
+        // --retry: integer in [0, MAX_RETRY]. See docs/retry-feature-design.md §R5.
+        $retryRaw = $options['retry'] ?? '0';
+        unset($options['retry']);
+        assert(is_string($retryRaw));
+        if ($retryRaw !== (string) (int) $retryRaw) {
+            throw new InvalidArgumentException(sprintf(
+                '--retry must be an integer between 0 and %d, value "%s" provided',
+                self::MAX_RETRY,
+                $retryRaw,
+            ));
+        }
+
+        $retry = (int) $retryRaw;
+        if ($retry < 0 || $retry > self::MAX_RETRY) {
+            throw new InvalidArgumentException(sprintf(
+                '--retry must be between 0 and %d, got %d',
+                self::MAX_RETRY,
+                $retry,
+            ));
+        }
+
+        // --junit-retry-metadata: boolean flag (VALUE_NONE).
+        assert(is_bool($options['junit-retry-metadata']));
+        $junitRetryMetadata = $options['junit-retry-metadata'];
+        unset($options['junit-retry-metadata']);
+
+        // --retry-on: comma-separated subset of {failure, error, skipped}. Default: failure,error.
+        // See docs/retry-feature-design.md §3.2 and docs/retry-feature-devils-advocate.md B3.
+        $retryOnRaw = $options['retry-on'] ?? 'failure,error';
+        unset($options['retry-on']);
+        assert(is_string($retryOnRaw));
+
+        $retryOnTokens = array_values(array_unique(array_filter(
+            array_map(static fn (string $token): string => trim($token), explode(',', $retryOnRaw)),
+            static fn (string $token): bool => $token !== '',
+        )));
+
+        foreach ($retryOnTokens as $token) {
+            if ($token === 'crash') {
+                throw new InvalidArgumentException(
+                    "Invalid --retry-on value: 'crash'. Worker crashes are not retriable in this release "
+                    . '(reserved for a future --retry-on=crash follow-up); accepted tokens: '
+                    . implode(', ', self::RETRY_ON_VALID_TOKENS),
+                );
+            }
+
+            if (! in_array($token, self::RETRY_ON_VALID_TOKENS, true)) {
+                throw new InvalidArgumentException(sprintf(
+                    "Invalid --retry-on value: '%s'. Accepted tokens: %s",
+                    $token,
+                    implode(', ', self::RETRY_ON_VALID_TOKENS),
+                ));
+            }
+        }
+
+        if ($retry > 0 && $retryOnTokens === []) {
+            throw new InvalidArgumentException('--retry-on must not be empty when --retry > 0');
+        }
+
+        $retryOn = array_map(
+            static function (string $token): MessageType {
+                // Validated above against RETRY_ON_VALID_TOKENS; default branch is unreachable.
+                return match ($token) {
+                    'failure' => MessageType::failure,
+                    'error' => MessageType::error,
+                    'skipped' => MessageType::skipped,
+                    default => throw new InvalidArgumentException(sprintf("Unmapped --retry-on token: '%s'", $token)),
+                };
+            },
+            $retryOnTokens,
+        );
+
         // Must be a static non-customizable reference because ParaTest code
         // is strictly coupled with PHPUnit pinned version
         $phpunit = self::getPhpunitBinary();
@@ -308,6 +403,9 @@ final readonly class Options
             $totalShards,
             $shardDistribution,
             $shardDistributionSeed,
+            $retry,
+            $junitRetryMetadata,
+            $retryOn,
         );
     }
 
@@ -400,6 +498,36 @@ final readonly class Options
                 InputOption::VALUE_REQUIRED,
                 'Seed for random shard test distribution. Defaults to the fixed value 0 to ensure reproducibility across different runs. Use different values to vary test distribution across runs',
                 '0',
+            ),
+            new InputOption(
+                'retry',
+                null,
+                InputOption::VALUE_REQUIRED,
+                sprintf(
+                    'Re-run failing tests up to N times (range [0, %d]). Disabled when --stop-on-* is set. '
+                    . 'With --coverage-*, line coverage is reported as the union across attempts — '
+                    . 'lines exercised only in failing attempts appear covered.',
+                    self::MAX_RETRY,
+                ),
+                '0',
+            ),
+            new InputOption(
+                'retry-on',
+                null,
+                InputOption::VALUE_REQUIRED,
+                'Comma-separated list of failure types that trigger retry. '
+                . 'Allowed tokens: ' . implode(', ', self::RETRY_ON_VALID_TOKENS) . '. '
+                . 'Default: failure,error.',
+                'failure,error',
+            ),
+            new InputOption(
+                'junit-retry-metadata',
+                null,
+                InputOption::VALUE_NONE,
+                'When set together with --retry>0 and --log-junit=FILE, emit Surefire-convention '
+                . '<flakyFailure>/<flakyError>/<rerunFailure>/<rerunError> children with a redundant '
+                . 'retries="N" attribute. Parsed natively by Jenkins, GitHub Actions test-reporter, '
+                . 'and Azure DevOps.',
             ),
 
             // PHPUnit options
