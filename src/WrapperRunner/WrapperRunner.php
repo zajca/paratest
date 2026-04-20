@@ -460,8 +460,40 @@ final class WrapperRunner implements RunnerInterface
      */
     private function complete(array $attemptOutcomesInput, ?RetryResult $retryResult): int
     {
+        // Rebuild required-file lists from attempt outcomes: the orchestrator
+        // moves per-attempt files to `{tmpDir}/attempt-N/` via rename(), so the
+        // paths recorded during flushWorker() point at non-existent locations.
+        // Outcomes carry post-archival paths (or original paths for final).
+        /** @var array<non-empty-string, true> $rebuiltTestResult */
+        $rebuiltTestResult = [];
+        /** @var array<non-empty-string, true> $rebuiltCoverage */
+        $rebuiltCoverage = [];
+        foreach ($attemptOutcomesInput as $outcome) {
+            foreach ($outcome->testResultFiles as $f) {
+                $path = $f->getPathname();
+                if ($path === '') {
+                    continue;
+                }
+
+                $rebuiltTestResult[$path] = true;
+            }
+
+            foreach ($outcome->coverageFiles as $f) {
+                $path = $f->getPathname();
+                if ($path === '') {
+                    continue;
+                }
+
+                $rebuiltCoverage[$path] = true;
+            }
+        }
+
+        $this->requiredTestResultFiles = $rebuiltTestResult;
+        $this->requiredCoverageFiles   = $rebuiltCoverage;
+
         // Validate test result files for workers that executed tests (across
         // every attempt — workers that crashed mid-attempt would be flagged here).
+        /** @var list<non-empty-string> $missingTestResultFiles */
         $missingTestResultFiles = [];
         foreach ($this->requiredTestResultFiles as $filePath => $true) {
             if (is_file($filePath)) {
@@ -700,6 +732,15 @@ final class WrapperRunner implements RunnerInterface
     /** @param list<AttemptOutcome> $attempts */
     private function generateJunitLog(array $attempts): void
     {
+        // JUnit XML is written only when the user configured `--log-junit`.
+        // Per-worker junit files may still exist (they are always generated
+        // when `--retry > 0` so the retry extractor can identify failures),
+        // but we must not try to serialize back to a destination path that
+        // was never configured — `logfileJunit()` throws in that case.
+        if (! $this->options->configuration->hasLogfileJunit()) {
+            return;
+        }
+
         $finalAttempt = end($attempts);
         assert($finalAttempt instanceof AttemptOutcome);
 

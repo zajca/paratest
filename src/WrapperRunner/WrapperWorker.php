@@ -73,7 +73,9 @@ final class WrapperWorker
             $this->resultCacheFile = new SplFileInfo($commonTmpFilePath . 'result_cache');
         }
 
-        if ($options->configuration->hasLogfileJunit()) {
+        // Retry needs per-worker JUnit XML to identify which tests failed between
+        // attempts, even when the user did not request `--log-junit`.
+        if ($options->configuration->hasLogfileJunit() || $options->retry > 0) {
             $this->junitFile = new SplFileInfo($commonTmpFilePath . 'junit');
         }
 
