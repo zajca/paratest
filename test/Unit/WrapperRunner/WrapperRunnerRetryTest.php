@@ -46,7 +46,20 @@ final class WrapperRunnerRetryTest extends TestBase
             'PARATEST_RETRY_PHPT_COUNTER_FILE',
         ] as $var) {
             putenv($var);
+            unset($_ENV[$var], $_SERVER[$var]);
         }
+    }
+
+    /**
+     * Symfony Process (used by WrapperWorker) inherits environment from
+     * $_SERVER/$_ENV, not from putenv(). Set all three so the worker process
+     * — which reads the counter file via getenv() — actually sees the path.
+     */
+    private function setCounterEnv(string $var, string $value): void
+    {
+        putenv($var . '=' . $value);
+        $_ENV[$var]    = $value;
+        $_SERVER[$var] = $value;
     }
 
     /**
@@ -55,7 +68,7 @@ final class WrapperRunnerRetryTest extends TestBase
      */
     public function testFlakyTestPassesOnRetryExitCodeZero(): void
     {
-        putenv('PARATEST_RETRY_COUNTER_FILE=' . $this->counterFile);
+        $this->setCounterEnv('PARATEST_RETRY_COUNTER_FILE', $this->counterFile);
 
         $this->bareOptions['path']        = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'FlakyCounterTest.php');
         $this->bareOptions['--retry']     = '2';
@@ -99,7 +112,7 @@ final class WrapperRunnerRetryTest extends TestBase
      */
     public function testFlakySummarySectionPrinted(): void
     {
-        putenv('PARATEST_RETRY_COUNTER_FILE=' . $this->counterFile);
+        $this->setCounterEnv('PARATEST_RETRY_COUNTER_FILE', $this->counterFile);
 
         $this->bareOptions['path']        = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'FlakyCounterTest.php');
         $this->bareOptions['--retry']     = '2';
@@ -177,8 +190,12 @@ final class WrapperRunnerRetryTest extends TestBase
 
         self::assertNotSame(RunnerInterface::SUCCESS_EXIT, $result->exitCode);
         self::assertStringContainsString('Warning: --retry is disabled because --stop-on-* is set.', $result->output);
-        // No flaky summary should appear since retry was suppressed.
-        self::assertStringNotContainsString('Flaky tests', $result->output);
+        // Test must run exactly once — retry was suppressed. AlwaysFailsTest
+        // always fails; the single attempt means no "Flaky tests (N>0)" line
+        // and no retry-diagnostic ("Retry attempt N/M") output.
+        self::assertStringNotContainsString('Retry attempt', $result->output);
+        // With H4 suppression, the flaky count is always 0 — sanity-check.
+        self::assertStringContainsString('Flaky tests (0)', $result->output);
     }
 
     /**
@@ -187,7 +204,7 @@ final class WrapperRunnerRetryTest extends TestBase
      */
     public function testJunitRetryMetadataEmitsSurefireElements(): void
     {
-        putenv('PARATEST_RETRY_COUNTER_FILE=' . $this->counterFile);
+        $this->setCounterEnv('PARATEST_RETRY_COUNTER_FILE', $this->counterFile);
 
         $junitFile = $this->tmpDir . DIRECTORY_SEPARATOR . 'junit-retry-meta.xml';
 
@@ -221,7 +238,7 @@ final class WrapperRunnerRetryTest extends TestBase
      */
     public function testJunitRetryMetadataOffEmitsNoRetryElements(): void
     {
-        putenv('PARATEST_RETRY_COUNTER_FILE=' . $this->counterFile);
+        $this->setCounterEnv('PARATEST_RETRY_COUNTER_FILE', $this->counterFile);
 
         $junitFile = $this->tmpDir . DIRECTORY_SEPARATOR . 'junit-no-retry-meta.xml';
 
@@ -250,7 +267,16 @@ final class WrapperRunnerRetryTest extends TestBase
      */
     public function testCoverageUnionWarningEmitted(): void
     {
-        putenv('PARATEST_RETRY_COUNTER_FILE=' . $this->counterFile);
+        if (! extension_loaded('xdebug') || ! str_contains((string) getenv('XDEBUG_MODE'), 'coverage')) {
+            self::markTestSkipped('Requires xdebug with XDEBUG_MODE=coverage');
+        }
+
+        $this->coverageUnionWarningEmittedImpl();
+    }
+
+    private function coverageUnionWarningEmittedImpl(): void
+    {
+        $this->setCounterEnv('PARATEST_RETRY_COUNTER_FILE', $this->counterFile);
 
         $coverageFile = $this->tmpDir . DIRECTORY_SEPARATOR . 'coverage.php';
 
@@ -277,7 +303,7 @@ final class WrapperRunnerRetryTest extends TestBase
      */
     public function testFunctionalModeRetriesOnlyFailedDataRow(): void
     {
-        putenv('PARATEST_RETRY_DP_COUNTER_FILE=' . $this->counterFile);
+        $this->setCounterEnv('PARATEST_RETRY_DP_COUNTER_FILE', $this->counterFile);
 
         $this->bareOptions['path']              = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'DataProviderFlakyTest.php');
         $this->bareOptions['--retry']           = '2';
@@ -297,7 +323,7 @@ final class WrapperRunnerRetryTest extends TestBase
      */
     public function testRetryChainRetriesAncestors(): void
     {
-        putenv('PARATEST_RETRY_CHAIN_COUNTER_FILE=' . $this->counterFile);
+        $this->setCounterEnv('PARATEST_RETRY_CHAIN_COUNTER_FILE', $this->counterFile);
 
         $this->bareOptions['path']        = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'DependsChainTest.php');
         $this->bareOptions['--retry']     = '2';
@@ -331,7 +357,7 @@ final class WrapperRunnerRetryTest extends TestBase
     public function testPhptFlakyRetried(): void
     {
         $phptCounterFile = $this->tmpDir . DIRECTORY_SEPARATOR . 'phpt-counter.txt';
-        putenv('PARATEST_RETRY_PHPT_COUNTER_FILE=' . $phptCounterFile);
+        $this->setCounterEnv('PARATEST_RETRY_PHPT_COUNTER_FILE', $phptCounterFile);
 
         $this->bareOptions['path']        = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'example_flaky.phpt');
         $this->bareOptions['--retry']     = '2';

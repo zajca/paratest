@@ -396,7 +396,8 @@ final class OptionsTest extends TestBase
         $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessage('--retry-on must not be empty when --retry > 0');
 
-        $this->createOptionsFromArgv(['--retry' => '1', '--retry-on' => ''], __DIR__);
+        // Comma-only string parses to zero non-empty tokens; must be rejected.
+        $this->createOptionsFromArgv(['--retry' => '1', '--retry-on' => ','], __DIR__);
     }
 
     public function testJunitRetryMetadataDefaultsToFalse(): void

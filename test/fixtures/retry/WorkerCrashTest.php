@@ -21,9 +21,9 @@ final class WorkerCrashTest extends TestCase
 
     public function testCrashes(): void
     {
-        // Call an undefined function to trigger a PHP fatal error (E_ERROR).
-        // PHPUnit cannot catch this — the worker process terminates immediately.
-        /** @phpstan-ignore-next-line */
-        \paratest_undefined_function_to_crash_the_worker();
+        // Kill the worker with an immediate exit — PHPUnit has no chance to
+        // record the result, so paratest sees a missing test_result file and
+        // raises WorkerCrashedException (which R3 requires NOT to be retried).
+        exit(139);
     }
 }

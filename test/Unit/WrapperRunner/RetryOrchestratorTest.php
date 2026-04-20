@@ -390,9 +390,8 @@ final class RetryOrchestratorTest extends TestBase
 
         $result = $orch->orchestrate(['/p/test.php'], $cb);
 
+        // Exactly one entry — deduplication must have occurred.
         self::assertSame(['DedupCls::testFlaky'], $result->flakyTests);
-        // Exactly one entry — deduplication must have occurred
-        self::assertCount(1, $result->flakyTests);
     }
 
     #[Test]
