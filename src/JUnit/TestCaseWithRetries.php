@@ -21,7 +21,8 @@ final readonly class TestCaseWithRetries extends TestCase
         float $time,
         public int $retries,
         public array $priorAttemptFailures,
-        public bool $finalAttemptPassed
+        public bool $finalAttemptPassed,
+        public ?TestCaseWithMessage $finalDefect = null,
     ) {
         parent::__construct($name, $class, $file, $line, $assertions, $time);
     }

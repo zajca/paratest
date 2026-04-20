@@ -207,6 +207,7 @@ final readonly class LogMerger
 
             $priorFailures      = $priorFailuresByKey[$key];
             $finalAttemptPassed = ! $this->isRetriableDefect($case);
+            $finalDefect        = $case instanceof TestCaseWithMessage ? $case : null;
 
             $cases[] = new TestCaseWithRetries(
                 $case->name,
@@ -218,6 +219,7 @@ final readonly class LogMerger
                 count($priorFailures),
                 $priorFailures,
                 $finalAttemptPassed,
+                $finalDefect,
             );
         }
 

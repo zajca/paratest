@@ -97,12 +97,13 @@ final readonly class Writer
             $caseNode->setAttribute('retries', (string) $case->retries);
         }
 
-        if ($case instanceof TestCaseWithMessage) {
-            if ($case->xmlTagName === MessageType::skipped) {
-                $defectNode = $this->document->createElement($case->xmlTagName->toString());
+        $defectSource = $case instanceof TestCaseWithRetries ? $case->finalDefect : ($case instanceof TestCaseWithMessage ? $case : null);
+        if ($defectSource !== null) {
+            if ($defectSource->xmlTagName === MessageType::skipped) {
+                $defectNode = $this->document->createElement($defectSource->xmlTagName->toString());
             } else {
-                $defectNode = $this->document->createElement($case->xmlTagName->toString(), htmlspecialchars($case->text, ENT_XML1));
-                $type       = $case->type;
+                $defectNode = $this->document->createElement($defectSource->xmlTagName->toString(), htmlspecialchars($defectSource->text, ENT_XML1));
+                $type       = $defectSource->type;
                 if ($type !== null) {
                     $defectNode->setAttribute('type', $type);
                 }
