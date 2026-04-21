@@ -152,7 +152,7 @@ final class WrapperRunner implements RunnerInterface
         $this->printer->start();
 
         // H4 — `--stop-on-*` takes priority over `--retry`. Warn and disable retry.
-        // See docs/retry-feature-devils-advocate.md H4.
+        //
         $effectiveRetry = $this->options->retry;
         if ($effectiveRetry > 0 && $this->isAnyStopOnFlagSet()) {
             $this->output->writeln(
@@ -542,7 +542,7 @@ final class WrapperRunner implements RunnerInterface
 
             // H2 — tests that failed then passed (flaky) must be re-written as
             // FAILURE in the cache so `--order-by=defects` prioritizes them on
-            // the next run. See docs/retry-feature-devils-advocate.md H2.
+            // the next run.
             if ($retryResult !== null && $retryResult->flakyTests !== []) {
                 foreach ($retryResult->flakyTests as $flakyKey) {
                     if (! str_contains($flakyKey, '::')) {

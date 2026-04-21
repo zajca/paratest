@@ -66,13 +66,13 @@ final readonly class Options
 
     /**
      * Validation bound for `--retry`. Values greater than this are rejected during
-     * CLI parsing. See docs/retry-feature-design.md §R5.
+     * CLI parsing.
      */
     public const int MAX_RETRY = 10;
 
     /**
      * Valid tokens accepted by `--retry-on`. `crash` is deliberately excluded — reserved
-     * for a future follow-up per R3 in docs/retry-feature-design.md.
+     * for a future follow-up.
      */
     private const array RETRY_ON_VALID_TOKENS = ['failure', 'error', 'skipped'];
 
@@ -276,7 +276,7 @@ final readonly class Options
             throw new InvalidArgumentException('Shard test distribution seed can only be used with random distribution');
         }
 
-        // --retry: integer in [0, MAX_RETRY]. See docs/retry-feature-design.md §R5.
+        // --retry: integer in [0, MAX_RETRY].
         $retryRaw = $options['retry'] ?? '0';
         unset($options['retry']);
         assert(is_string($retryRaw));
@@ -303,7 +303,6 @@ final readonly class Options
         unset($options['junit-retry-metadata']);
 
         // --retry-on: comma-separated subset of {failure, error, skipped}. Default: failure,error.
-        // See docs/retry-feature-design.md §3.2 and docs/retry-feature-devils-advocate.md B3.
         $retryOnRaw = $options['retry-on'] ?? 'failure,error';
         unset($options['retry-on']);
         assert(is_string($retryOnRaw));

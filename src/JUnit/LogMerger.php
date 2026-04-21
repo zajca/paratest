@@ -73,7 +73,7 @@ final readonly class LogMerger
     }
 
     /**
-     * Cross-attempt JUnit merge (see docs/retry-feature-design.md §3.3).
+     * Cross-attempt JUnit merge.
      *
      * Takes per-attempt JUnit file lists keyed by 1-based attempt number and
      * produces a canonical TestSuite whose leaves are annotated with retry

@@ -73,8 +73,6 @@ final readonly class SuiteLoader
      * Populated by Pass 1 (`loadFiles()` iteration collects direct edges) + Pass 2
      * (`buildDependsMap()` iterative DFS with memoization + cycle guard).
      *
-     * See `docs/retry-feature-design.md` §2.4.
-     *
      * @var array<string, list<string>>
      */
     public array $dependsMap;
@@ -181,7 +179,7 @@ final readonly class SuiteLoader
 
             $tests[] = "$file\0$name";
 
-            // Pass 1 — direct `@depends` edges. See docs/retry-feature-design.md §2.4.
+            // Pass 1 — direct `@depends` edges.
             // Key = "Class::method" of the dependent test. PHPT and `DataProviderTestSuite`
             // nodes are skipped above / traversed by loadFiles; they don't participate in @depends.
             $key             = $test::class . '::' . $test->name();
@@ -284,7 +282,7 @@ final readonly class SuiteLoader
      * `"::ClassName"` are expanded here to every known key with a matching
      * `"ClassName::"` prefix.
      *
-     * See docs/retry-feature-design.md §2.4.
+     *
      *
      * @param array<string, list<string>> $directDeps
      * @param array<string, bool>         $knownKeys

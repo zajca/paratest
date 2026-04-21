@@ -24,7 +24,7 @@ use function sprintf;
 /**
  * Drives the retry loop around `WrapperRunner::runAttempt()`.
  *
- * See `docs/retry-feature-design.md` §2.1. Only instantiated when
+ *  Only instantiated when
  * `Options::$retry > 0`; the retry=0 path in `WrapperRunner::run()` bypasses
  * this orchestrator entirely to preserve bit-identical behavior (§2.8).
  *
@@ -101,7 +101,7 @@ final class RetryOrchestrator
 
             // Archive this (non-final) attempt's artifacts into {tmpDir}/attempt-N/
             // and mutate the AttemptOutcome's SplFileInfo lists to reflect the
-            // new paths. See docs/retry-feature-design.md §2.6.
+            // new paths.
             $archivedOutcome = $this->archiveAttempt($outcome);
             // Replace the last outcome with the archived version so downstream
             // complete()/coverage aggregation reads from the archived paths.

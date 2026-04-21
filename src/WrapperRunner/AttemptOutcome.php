@@ -11,7 +11,7 @@ use SplFileInfo;
  * Immutable snapshot of a single retry attempt's worker-produced artifacts plus
  * its aggregated PHPUnit `TestResult`.
  *
- * See `docs/retry-feature-design.md` §2.2. Field types mirror the per-attempt
+ *  Field types mirror the per-attempt
  * accumulator arrays on `WrapperRunner` so the attempt outcome can be fed back
  * into `WrapperRunner::complete()` without transformation.
  *

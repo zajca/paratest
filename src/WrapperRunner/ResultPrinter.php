@@ -62,7 +62,7 @@ final class ResultPrinter
      * Toggled on by `WrapperRunner::runAttempt()` for non-final attempts;
      * final-attempt events are streamed normally.
      *
-     * See docs/retry-feature-devils-advocate.md H1.
+     *
      */
     private bool $suppressTeamcityStdout = false;
 
@@ -105,7 +105,7 @@ final class ResultPrinter
     /**
      * Controls whether live TeamCity (stdout) events are emitted during
      * {@see self::printFeedback()}. See {@see $suppressTeamcityStdout} and
-     * docs/retry-feature-devils-advocate.md H1.
+     * .
      */
     public function setSuppressTeamcityStdout(bool $suppress): void
     {
@@ -289,7 +289,7 @@ final class ResultPrinter
 
         // R4 — Flaky tests summary. Emitted only when --retry>0 so output is
         // bit-identical to pre-retry behavior on the default (retry=0) path.
-        // See docs/retry-feature-design.md §R4.
+        //
         if ($this->options->retry <= 0) {
             return;
         }
