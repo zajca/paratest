@@ -13,9 +13,14 @@ use SplFileInfo;
 use Symfony\Component\Filesystem\Filesystem;
 
 use function file_put_contents;
+use function ini_restore;
+use function ini_set;
 use function mkdir;
+use function preg_match;
 use function preg_quote;
 use function sprintf;
+use function strlen;
+use function substr;
 use function sys_get_temp_dir;
 use function uniqid;
 
@@ -47,11 +52,11 @@ final class FailedTestExtractorTest extends TestCase
 
     public function testExtractFailuresReturnsEmptyForAllPassing(): void
     {
-        $xml = <<<XML
+        $xml       = <<<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="1" failures="0" errors="0" skipped="0" assertions="1" time="0.001" file="/path/ExampleTest.php">
-    <testcase name="testPass" class="ExampleTest" file="/path/ExampleTest.php" line="10" assertions="1" time="0.001"/>
+	<testcase name="testPass" class="ExampleTest" file="/path/ExampleTest.php" line="10" assertions="1" time="0.001"/>
   </testsuite>
 </testsuites>
 XML;
@@ -63,8 +68,8 @@ XML;
 
     public function testExtractFailuresEmitsBareFilePathInNonFunctionalMode(): void
     {
-        $testFile = '/path/to/ExampleTest.php';
-        $xml      = <<<XML
+        $testFile  = '/path/to/ExampleTest.php';
+        $xml       = <<<XML
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="1" failures="1" errors="0" skipped="0" assertions="1" time="0.001" file="{$testFile}">
@@ -82,9 +87,9 @@ XML;
 
     public function testExtractFailuresEmitsPcreWorkItemInFunctionalMode(): void
     {
-        $testFile = '/path/to/ExampleTest.php';
-        $testName = 'testFoo';
-        $xml      = <<<XML
+        $testFile  = '/path/to/ExampleTest.php';
+        $testName  = 'testFoo';
+        $xml       = <<<XML
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="1" failures="1" errors="0" skipped="0" assertions="1" time="0.001" file="{$testFile}">
@@ -105,8 +110,8 @@ XML;
     {
         $testFile = '/path/to/ExampleTest.php';
         // JUnit name includes dataset suffix exactly as PHPUnit writes it
-        $testName = 'testFoo with data set #0';
-        $xml      = <<<XML
+        $testName  = 'testFoo with data set #0';
+        $xml       = <<<XML
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="1" failures="1" errors="0" skipped="0" assertions="1" time="0.001" file="{$testFile}">
@@ -149,7 +154,7 @@ XML;
   </testsuite>
 </testsuites>
 XML;
-        $file = $this->writeJunit($xml);
+        $file     = $this->writeJunit($xml);
 
         // retryOn = [error] only — failure must be excluded
         $extractor = new FailedTestExtractor([MessageType::error], [], false);
@@ -173,7 +178,7 @@ XML;
   </testsuite>
 </testsuites>
 XML;
-        $file = $this->writeJunit($xml);
+        $file     = $this->writeJunit($xml);
 
         // Without skipped in retryOn — should NOT emit
         $extractor = new FailedTestExtractor([MessageType::failure, MessageType::error], [], false);
@@ -186,8 +191,8 @@ XML;
 
     public function testExtractFailuresDeduplicatesSameFile(): void
     {
-        $testFile = '/path/to/ExampleTest.php';
-        $xml      = <<<XML
+        $testFile  = '/path/to/ExampleTest.php';
+        $xml       = <<<XML
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="2" failures="2" errors="0" skipped="0" assertions="2" time="0.002" file="{$testFile}">
@@ -212,8 +217,8 @@ XML;
 
     public function testExtractFailureDetailsIncludesDisplayNamesForRetriedTests(): void
     {
-        $testFile = '/path/to/ExampleTest.php';
-        $xml      = <<<XML
+        $testFile  = '/path/to/ExampleTest.php';
+        $xml       = <<<XML
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="2" failures="2" errors="0" skipped="0" assertions="2" time="0.002" file="{$testFile}">
@@ -242,7 +247,7 @@ XML;
     {
         $testFile = '/path/to/ExampleTest.php';
         // Only C fails — but C depends on B which depends on A
-        $xml = <<<XML
+        $xml  = <<<XML
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="3" failures="1" errors="0" skipped="0" assertions="3" time="0.003" file="{$testFile}">
@@ -262,15 +267,43 @@ XML;
 
         $result = $extractor->extractFailures([$file]);
 
-        // In functional mode each entry is "$file\0/$pcre$/"
-        // We expect three work items: for testC, testB, testA
-        self::assertCount(3, $result);
+        self::assertSame(
+            [
+                sprintf("%s\0/%s\$/", $testFile, preg_quote('testA', '/')),
+                sprintf("%s\0/%s\$/", $testFile, preg_quote('testB', '/')),
+                sprintf("%s\0/%s\$/", $testFile, preg_quote('testC', '/')),
+            ],
+            $result,
+        );
+    }
 
-        $expectedNames = ['testC', 'testB', 'testA'];
-        foreach ($expectedNames as $name) {
-            $expectedItem = sprintf("%s\0/%s\$/", $testFile, preg_quote($name, '/'));
-            self::assertContains($expectedItem, $result, "Expected work item for {$name} not found");
-        }
+    public function testExtractFailuresUsesMappedAncestorFileForCrossFileDepends(): void
+    {
+        $failingTestFile  = '/path/to/ConsumerTest.php';
+        $ancestorTestFile = '/path/to/ProducerTest.php';
+        $xml              = <<<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="ConsumerTest" tests="1" failures="1" errors="0" skipped="0" assertions="1" time="0.001" file="{$failingTestFile}">
+    <testcase name="testConsumer" class="ConsumerTest" file="{$failingTestFile}" line="30" assertions="1" time="0.001">
+      <failure type="PHPUnit\Framework\AssertionFailedError">Consumer failed</failure>
+    </testcase>
+  </testsuite>
+</testsuites>
+XML;
+        $file             = $this->writeJunit($xml);
+
+        $extractor = new FailedTestExtractor(
+            [MessageType::failure],
+            ['ConsumerTest::testConsumer' => ['ProducerTest::testProducer']],
+            false,
+            ['ProducerTest::testProducer' => $ancestorTestFile],
+        );
+
+        self::assertSame(
+            [$ancestorTestFile, $failingTestFile],
+            $extractor->extractFailures([$file]),
+        );
     }
 
     public function testExtractFailuresDetectsPhptByClassAttribute(): void
@@ -286,7 +319,7 @@ XML;
   </testsuite>
 </testsuites>
 XML;
-        $file = $this->writeJunit($xml);
+        $file     = $this->writeJunit($xml);
 
         // Functional mode: PHPT must still emit bare file path, never a PCRE work item
         $extractor = new FailedTestExtractor([MessageType::failure, MessageType::error], [], true);
@@ -312,7 +345,7 @@ XML;
   </testsuite>
 </testsuites>
 XML;
-        $file = $this->writeJunit($xml);
+        $file        = $this->writeJunit($xml);
 
         // dependsMap: testC depends on an ancestor whose name contains a null byte
         $dependsMap = ['ExampleTest::testC' => [$ancestorKey]];

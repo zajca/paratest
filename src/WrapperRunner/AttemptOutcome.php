@@ -11,8 +11,7 @@ use SplFileInfo;
  * Immutable snapshot of a single retry attempt's worker-produced artifacts plus
  * its aggregated PHPUnit `TestResult`.
  *
- *  Field types mirror the per-attempt
- * accumulator arrays on `WrapperRunner` so the attempt outcome can be fed back
+ * Field types mirror the per-attempt accumulator arrays on `WrapperRunner` so the attempt outcome can be fed back
  * into `WrapperRunner::complete()` without transformation.
  *
  * @internal
@@ -22,8 +21,8 @@ use SplFileInfo;
 final readonly class AttemptOutcome
 {
     /**
-     * @param int                    $attemptNumber    1-based attempt index.
-     * @param list<non-empty-string> $executedWorkItems Work-item identifiers submitted to workers for this attempt.
+     * @param int                    $attemptNumber           1-based attempt index.
+     * @param list<non-empty-string> $executedWorkItems       Work-item identifiers submitted to workers for this attempt.
      * @param list<SplFileInfo>      $junitFiles
      * @param list<SplFileInfo>      $coverageFiles
      * @param list<SplFileInfo>      $testResultFiles
@@ -33,6 +32,8 @@ final readonly class AttemptOutcome
      * @param list<SplFileInfo>      $progressFiles
      * @param list<SplFileInfo>      $unexpectedOutputFiles
      * @param list<SplFileInfo>      $statusFiles
+     * @param list<SplFileInfo>      $requiredTestResultFiles Test result files expected from workers that executed tests.
+     * @param list<SplFileInfo>      $requiredCoverageFiles   Coverage files expected from workers that executed tests.
      */
     public function __construct(
         public int $attemptNumber,
@@ -46,6 +47,8 @@ final readonly class AttemptOutcome
         public array $progressFiles,
         public array $unexpectedOutputFiles,
         public array $statusFiles,
+        public array $requiredTestResultFiles,
+        public array $requiredCoverageFiles,
         public int $exitcode,
         public TestResult $testResultAggregate,
     ) {

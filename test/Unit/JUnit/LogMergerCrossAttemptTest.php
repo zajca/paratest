@@ -6,6 +6,7 @@ namespace ParaTest\Tests\Unit\JUnit;
 
 use ParaTest\JUnit\LogMerger;
 use ParaTest\JUnit\TestCaseWithRetries;
+use ParaTest\JUnit\TestSuite;
 use ParaTest\JUnit\Writer;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\TestCase;
@@ -46,7 +47,7 @@ final class LogMergerCrossAttemptTest extends TestCase
         return new SplFileInfo($path);
     }
 
-    private function renderAsXml(\ParaTest\JUnit\TestSuite $suite): string
+    private function renderAsXml(TestSuite $suite): string
     {
         $outputPath = $this->tmpDir . '/out-' . uniqid('', true) . '.xml';
         (new Writer())->write($suite, $outputPath);
@@ -66,12 +67,12 @@ final class LogMergerCrossAttemptTest extends TestCase
     {
         // When only one attempt is given the result must be structurally
         // equivalent to LogMerger::merge() — no retry metadata, no retries attribute.
-        $xml = <<<XML
+        $xml    = <<<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="2" failures="0" errors="0" skipped="0" assertions="2" time="0.003" file="/p/ExampleTest.php">
-    <testcase name="testOne" class="ExampleTest" file="/p/ExampleTest.php" line="10" assertions="1" time="0.001"/>
-    <testcase name="testTwo" class="ExampleTest" file="/p/ExampleTest.php" line="20" assertions="1" time="0.002"/>
+	<testcase name="testOne" class="ExampleTest" file="/p/ExampleTest.php" line="10" assertions="1" time="0.001"/>
+	<testcase name="testTwo" class="ExampleTest" file="/p/ExampleTest.php" line="20" assertions="1" time="0.002"/>
   </testsuite>
 </testsuites>
 XML;
@@ -103,23 +104,23 @@ XML;
         // Attempt 1: testFlaky fails with <failure>.
         // Attempt 2 (final): testFlaky passes (no failure element).
         // Expected: <flakyFailure> child under <testcase>, retries="1", no top-level <failure>.
-        $attempt1Xml = <<<XML
+        $attempt1Xml = <<<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="1" failures="1" errors="0" skipped="0" assertions="1" time="0.002" file="/p/ExampleTest.php">
-    <testcase name="testFlaky" class="ExampleTest" file="/p/ExampleTest.php" line="20" assertions="1" time="0.002">
-      <failure type="PHPUnit\Framework\AssertionFailedError" message="Failed assertion">ExampleTest::testFlaky
+	<testcase name="testFlaky" class="ExampleTest" file="/p/ExampleTest.php" line="20" assertions="1" time="0.002">
+	  <failure type="PHPUnit\Framework\AssertionFailedError" message="Failed assertion">ExampleTest::testFlaky
 stack trace here</failure>
-    </testcase>
+	</testcase>
   </testsuite>
 </testsuites>
 XML;
 
-        $attempt2Xml = <<<XML
+        $attempt2Xml = <<<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="1" failures="0" errors="0" skipped="0" assertions="1" time="0.001" file="/p/ExampleTest.php">
-    <testcase name="testFlaky" class="ExampleTest" file="/p/ExampleTest.php" line="20" assertions="1" time="0.001"/>
+	<testcase name="testFlaky" class="ExampleTest" file="/p/ExampleTest.php" line="20" assertions="1" time="0.001"/>
   </testsuite>
 </testsuites>
 XML;
@@ -150,29 +151,74 @@ XML;
         self::assertStringNotContainsString('<failure', $rendered);
     }
 
+    public function testMergeAcrossAttemptsKeepsTestsThatPassedBeforeRetry(): void
+    {
+        $attempt1Xml = <<<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="DataProviderTest" tests="3" failures="1" errors="0" skipped="0" assertions="3" time="0.003" file="/p/DataProviderTest.php">
+    <testcase name="testRow with data set #0" class="DataProviderTest" file="/p/DataProviderTest.php" line="20" assertions="1" time="0.001"/>
+    <testcase name="testRow with data set #1" class="DataProviderTest" file="/p/DataProviderTest.php" line="20" assertions="1" time="0.001">
+      <failure type="PHPUnit\Framework\AssertionFailedError">First attempt failed</failure>
+    </testcase>
+    <testcase name="testRow with data set #2" class="DataProviderTest" file="/p/DataProviderTest.php" line="20" assertions="1" time="0.001"/>
+  </testsuite>
+</testsuites>
+XML;
+
+        $attempt2Xml = <<<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="DataProviderTest" tests="1" failures="0" errors="0" skipped="0" assertions="1" time="0.001" file="/p/DataProviderTest.php">
+    <testcase name="testRow with data set #1" class="DataProviderTest" file="/p/DataProviderTest.php" line="20" assertions="1" time="0.001"/>
+  </testsuite>
+</testsuites>
+XML;
+
+        $f1     = $this->writeJunit($attempt1Xml);
+        $f2     = $this->writeJunit($attempt2Xml);
+        $merger = new LogMerger();
+        $result = $merger->mergeAcrossAttempts([1 => [$f1], 2 => [$f2]], false);
+
+        self::assertNotNull($result);
+        self::assertSame(3, $result->tests);
+        self::assertSame(3, $result->assertions);
+        self::assertSame(0, $result->failures);
+        self::assertCount(3, $result->cases);
+
+        $rendered = $this->renderAsXml($result);
+
+        self::assertSame(3, substr_count($rendered, '<testcase '));
+        self::assertStringContainsString('testRow with data set #0', $rendered);
+        self::assertStringContainsString('testRow with data set #1', $rendered);
+        self::assertStringContainsString('testRow with data set #2', $rendered);
+        self::assertStringNotContainsString('<failure', $rendered);
+        self::assertStringNotContainsString('retries=', $rendered);
+    }
+
     public function testMergeAcrossAttemptsFlakyErrorEmitsFlakyErrorElement(): void
     {
         // Attempt 1: testFlakyError fails with <error>.
         // Attempt 2 (final): testFlakyError passes.
         // Expected: <flakyError> child under <testcase>, retries="1", no top-level <error>.
-        $attempt1Xml = <<<XML
+        $attempt1Xml = <<<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="1" failures="0" errors="1" skipped="0" assertions="1" time="0.002" file="/p/ExampleTest.php">
-    <testcase name="testFlakyError" class="ExampleTest" file="/p/ExampleTest.php" line="30" assertions="1" time="0.002">
-      <error type="RuntimeException" message="Unexpected error">ExampleTest::testFlakyError
+	<testcase name="testFlakyError" class="ExampleTest" file="/p/ExampleTest.php" line="30" assertions="1" time="0.002">
+	  <error type="RuntimeException" message="Unexpected error">ExampleTest::testFlakyError
 RuntimeException: Unexpected error
 #0 /p/ExampleTest.php:35</error>
-    </testcase>
+	</testcase>
   </testsuite>
 </testsuites>
 XML;
 
-        $attempt2Xml = <<<XML
+        $attempt2Xml = <<<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="1" failures="0" errors="0" skipped="0" assertions="1" time="0.001" file="/p/ExampleTest.php">
-    <testcase name="testFlakyError" class="ExampleTest" file="/p/ExampleTest.php" line="30" assertions="1" time="0.001"/>
+	<testcase name="testFlakyError" class="ExampleTest" file="/p/ExampleTest.php" line="30" assertions="1" time="0.001"/>
   </testsuite>
 </testsuites>
 XML;
@@ -215,24 +261,24 @@ XML;
         // Fix: Writer must also check ($case instanceof TestCaseWithRetries && !$case->finalAttemptPassed)
         // and emit the final failure element from $case itself (which is a TestCaseWithMessage in
         // the decorated tree, or the failure info must be preserved differently).
-        $attempt1Xml = <<<XML
+        $attempt1Xml = <<<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="1" failures="1" errors="0" skipped="0" assertions="1" time="0.002" file="/p/ExampleTest.php">
-    <testcase name="testAlwaysFails" class="ExampleTest" file="/p/ExampleTest.php" line="40" assertions="1" time="0.002">
-      <failure type="PHPUnit\Framework\AssertionFailedError" message="First attempt failure">First attempt stack trace</failure>
-    </testcase>
+	<testcase name="testAlwaysFails" class="ExampleTest" file="/p/ExampleTest.php" line="40" assertions="1" time="0.002">
+	  <failure type="PHPUnit\Framework\AssertionFailedError" message="First attempt failure">First attempt stack trace</failure>
+	</testcase>
   </testsuite>
 </testsuites>
 XML;
 
-        $attempt2Xml = <<<XML
+        $attempt2Xml = <<<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="1" failures="1" errors="0" skipped="0" assertions="1" time="0.003" file="/p/ExampleTest.php">
-    <testcase name="testAlwaysFails" class="ExampleTest" file="/p/ExampleTest.php" line="40" assertions="1" time="0.003">
-      <failure type="PHPUnit\Framework\AssertionFailedError" message="Second attempt failure">Second attempt stack trace</failure>
-    </testcase>
+	<testcase name="testAlwaysFails" class="ExampleTest" file="/p/ExampleTest.php" line="40" assertions="1" time="0.003">
+	  <failure type="PHPUnit\Framework\AssertionFailedError" message="Second attempt failure">Second attempt stack trace</failure>
+	</testcase>
   </testsuite>
 </testsuites>
 XML;
@@ -267,33 +313,33 @@ XML;
     public function testMergeAcrossAttemptsMultiplePriorAttempts(): void
     {
         // 3 attempts: fail, fail, pass → retries="2", TWO <flakyFailure> children.
-        $attempt1Xml = <<<XML
+        $attempt1Xml = <<<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="1" failures="1" errors="0" skipped="0" assertions="1" time="0.002" file="/p/ExampleTest.php">
-    <testcase name="testEventuallyPasses" class="ExampleTest" file="/p/ExampleTest.php" line="50" assertions="1" time="0.002">
-      <failure type="PHPUnit\Framework\AssertionFailedError" message="Attempt 1 failure">Attempt 1 trace</failure>
-    </testcase>
+	<testcase name="testEventuallyPasses" class="ExampleTest" file="/p/ExampleTest.php" line="50" assertions="1" time="0.002">
+	  <failure type="PHPUnit\Framework\AssertionFailedError" message="Attempt 1 failure">Attempt 1 trace</failure>
+	</testcase>
   </testsuite>
 </testsuites>
 XML;
 
-        $attempt2Xml = <<<XML
+        $attempt2Xml = <<<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="1" failures="1" errors="0" skipped="0" assertions="1" time="0.003" file="/p/ExampleTest.php">
-    <testcase name="testEventuallyPasses" class="ExampleTest" file="/p/ExampleTest.php" line="50" assertions="1" time="0.003">
-      <failure type="PHPUnit\Framework\AssertionFailedError" message="Attempt 2 failure">Attempt 2 trace</failure>
-    </testcase>
+	<testcase name="testEventuallyPasses" class="ExampleTest" file="/p/ExampleTest.php" line="50" assertions="1" time="0.003">
+	  <failure type="PHPUnit\Framework\AssertionFailedError" message="Attempt 2 failure">Attempt 2 trace</failure>
+	</testcase>
   </testsuite>
 </testsuites>
 XML;
 
-        $attempt3Xml = <<<XML
+        $attempt3Xml = <<<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites>
   <testsuite name="ExampleTest" tests="1" failures="0" errors="0" skipped="0" assertions="1" time="0.001" file="/p/ExampleTest.php">
-    <testcase name="testEventuallyPasses" class="ExampleTest" file="/p/ExampleTest.php" line="50" assertions="1" time="0.001"/>
+	<testcase name="testEventuallyPasses" class="ExampleTest" file="/p/ExampleTest.php" line="50" assertions="1" time="0.001"/>
   </testsuite>
 </testsuites>
 XML;

@@ -55,15 +55,15 @@ final class RetryOrchestrator
      * Executes attempts until the pending set is empty, the max attempt count
      * is reached, or a `stopOn*` trigger fires.
      *
-     * @param list<non-empty-string>                                         $initialPending
-     * @param callable(int, list<non-empty-string>): AttemptOutcome          $attemptRunner
+     * @param list<non-empty-string>                                $initialPending
+     * @param callable(int, list<non-empty-string>): AttemptOutcome $attemptRunner
      */
     public function orchestrate(array $initialPending, callable $attemptRunner): RetryResult
     {
         $maxAttempts = $this->options->retry + 1;
         /** @var list<AttemptOutcome> $attempts */
-        $attempts          = [];
-        $pending           = $initialPending;
+        $attempts = [];
+        $pending  = $initialPending;
         /** @var array<int, list<SplFileInfo>> $archivedJunitsPerAttempt */
         $archivedJunitsPerAttempt = [];
 
@@ -170,18 +170,30 @@ final class RetryOrchestrator
             throw new RuntimeException(sprintf('Failed to create archival directory: %s', $attemptDir));
         }
 
+        $junitFiles            = $this->archiveFiles($outcome->junitFiles, $attemptDir);
+        $coverageFiles         = $this->archiveFiles($outcome->coverageFiles, $attemptDir);
+        $testResultFiles       = $this->archiveFiles($outcome->testResultFiles, $attemptDir);
+        $testdoxFiles          = $this->archiveFiles($outcome->testdoxFiles, $attemptDir);
+        $teamcityFiles         = $this->archiveFiles($outcome->teamcityFiles, $attemptDir);
+        $resultCacheFiles      = $this->archiveFiles($outcome->resultCacheFiles, $attemptDir);
+        $progressFiles         = $this->archiveFiles($outcome->progressFiles, $attemptDir);
+        $unexpectedOutputFiles = $this->archiveFiles($outcome->unexpectedOutputFiles, $attemptDir);
+        $statusFiles           = $this->archiveFiles($outcome->statusFiles, $attemptDir);
+
         return new AttemptOutcome(
             $outcome->attemptNumber,
             $outcome->executedWorkItems,
-            $this->archiveFiles($outcome->junitFiles, $attemptDir),
-            $this->archiveFiles($outcome->coverageFiles, $attemptDir),
-            $this->archiveFiles($outcome->testResultFiles, $attemptDir),
-            $this->archiveFiles($outcome->testdoxFiles, $attemptDir),
-            $this->archiveFiles($outcome->teamcityFiles, $attemptDir),
-            $this->archiveFiles($outcome->resultCacheFiles, $attemptDir),
-            $this->archiveFiles($outcome->progressFiles, $attemptDir),
-            $this->archiveFiles($outcome->unexpectedOutputFiles, $attemptDir),
-            $this->archiveFiles($outcome->statusFiles, $attemptDir),
+            $junitFiles,
+            $coverageFiles,
+            $testResultFiles,
+            $testdoxFiles,
+            $teamcityFiles,
+            $resultCacheFiles,
+            $progressFiles,
+            $unexpectedOutputFiles,
+            $statusFiles,
+            $this->remapRequiredFiles($outcome->requiredTestResultFiles, $testResultFiles),
+            $this->remapRequiredFiles($outcome->requiredCoverageFiles, $coverageFiles),
             $outcome->exitcode,
             $outcome->testResultAggregate,
         );
@@ -224,6 +236,28 @@ final class RetryOrchestrator
     }
 
     /**
+     * @param list<SplFileInfo> $requiredFiles
+     * @param list<SplFileInfo> $archivedFiles
+     *
+     * @return list<SplFileInfo>
+     */
+    private function remapRequiredFiles(array $requiredFiles, array $archivedFiles): array
+    {
+        /** @var array<string, SplFileInfo> $archivedByFilename */
+        $archivedByFilename = [];
+        foreach ($archivedFiles as $file) {
+            $archivedByFilename[$file->getFilename()] = $file;
+        }
+
+        $remapped = [];
+        foreach ($requiredFiles as $file) {
+            $remapped[] = $archivedByFilename[$file->getFilename()] ?? $file;
+        }
+
+        return $remapped;
+    }
+
+    /**
      * A test is "flaky" iff it failed in at least one non-final attempt
      * (message matches `--retry-on` filter) and passed in the final attempt.
      *
@@ -233,8 +267,8 @@ final class RetryOrchestrator
      */
     private function computeFlakyTests(array $attempts): array
     {
-        $final        = $attempts[count($attempts) - 1];
-        $finalFailed  = $this->collectFailedKeys($final->junitFiles);
+        $final          = $attempts[count($attempts) - 1];
+        $finalNotPassed = $this->collectNotPassedKeys($final->junitFiles);
         /** @var array<string, true> $priorFailed */
         $priorFailed = [];
 
@@ -246,7 +280,7 @@ final class RetryOrchestrator
 
         $flaky = [];
         foreach ($priorFailed as $key => $_true) {
-            if (isset($finalFailed[$key])) {
+            if (isset($finalNotPassed[$key])) {
                 continue;
             }
 
@@ -280,8 +314,28 @@ final class RetryOrchestrator
     }
 
     /**
-     * @param list<MessageType>      $retryOn
-     * @param array<string, true>    $failed
+     * @param list<SplFileInfo> $junitFiles
+     *
+     * @return array<string, true>
+     */
+    private function collectNotPassedKeys(array $junitFiles): array
+    {
+        $notPassed = [];
+        foreach ($junitFiles as $junitFile) {
+            if (! $junitFile->isFile() || (int) $junitFile->getSize() <= 0) {
+                continue;
+            }
+
+            $suite = JUnitTestSuite::fromFile($junitFile);
+            $this->walkNotPassedCases($suite, $notPassed);
+        }
+
+        return $notPassed;
+    }
+
+    /**
+     * @param list<MessageType>   $retryOn
+     * @param array<string, true> $failed
      */
     private function walkCases(JUnitTestSuite $suite, array $retryOn, array &$failed): void
     {
@@ -302,6 +356,22 @@ final class RetryOrchestrator
 
         foreach ($suite->suites as $child) {
             $this->walkCases($child, $retryOn, $failed);
+        }
+    }
+
+    /** @param array<string, true> $notPassed */
+    private function walkNotPassedCases(JUnitTestSuite $suite, array &$notPassed): void
+    {
+        foreach ($suite->cases as $case) {
+            if (! $case instanceof TestCaseWithMessage) {
+                continue;
+            }
+
+            $notPassed[$case->class . '::' . $case->name] = true;
+        }
+
+        foreach ($suite->suites as $child) {
+            $this->walkNotPassedCases($child, $notPassed);
         }
     }
 }

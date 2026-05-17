@@ -16,10 +16,7 @@ use PHPUnit\TestRunner\TestResult\TestResult;
 use ReflectionClass;
 use SplFileInfo;
 use Symfony\Component\Console\Output\BufferedOutput;
-use Symfony\Component\Console\Output\NullOutput;
 
-use function array_map;
-use function count;
 use function file_put_contents;
 use function is_dir;
 use function mkdir;
@@ -48,6 +45,7 @@ final class RetryOrchestratorTest extends TestBase
     protected function tearDown(): void
     {
         $this->removeDirectory($this->junitDir);
+
         parent::tearDown();
     }
 
@@ -94,8 +92,7 @@ final class RetryOrchestratorTest extends TestBase
         // filesystem and take time). We only need testCount to be non-zero for
         // the output message in the orchestrator.
         $loaderReflection = new ReflectionClass(SuiteLoader::class);
-        /** @var SuiteLoader $suiteLoader */
-        $suiteLoader = $loaderReflection->newInstanceWithoutConstructor();
+        $suiteLoader      = $loaderReflection->newInstanceWithoutConstructor();
 
         $testCountProp = $loaderReflection->getProperty('testCount');
         $testCountProp->setValue($suiteLoader, 10);
@@ -193,6 +190,23 @@ final class RetryOrchestratorTest extends TestBase
         );
     }
 
+    private function skippedJunit(string $class, string $method, string $suiteName = 'Suite'): string
+    {
+        return sprintf(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            . '<testsuites>'
+            . '<testsuite name="%s" tests="1" assertions="0" failures="0" errors="0" skipped="1" time="0.001">'
+            . '<testcase name="%s" class="%s" file="/p/test.php" line="10" assertions="0" time="0.001">'
+            . '<skipped/>'
+            . '</testcase>'
+            . '</testsuite>'
+            . '</testsuites>',
+            $suiteName,
+            $method,
+            $class,
+        );
+    }
+
     /**
      * Builds an AttemptOutcome for the given attempt number.
      *
@@ -204,6 +218,8 @@ final class RetryOrchestratorTest extends TestBase
             $attemptNumber,
             [],
             $junitFiles,
+            [],
+            [],
             [],
             [],
             [],
@@ -355,6 +371,7 @@ final class RetryOrchestratorTest extends TestBase
         $callCount = 0;
         $cb        = function (int $attempt, array $pending) use (&$callCount): AttemptOutcome {
             ++$callCount;
+
             // Return a clean (empty) outcome: no junit files → extractor finds nothing
             return $this->makeOutcome($attempt, []);
         };
@@ -414,6 +431,35 @@ final class RetryOrchestratorTest extends TestBase
         // 3 total attempts (retry=2)
         self::assertCount(3, $result->allAttempts);
         // The test failed in ALL attempts including the final one → it is stably failing, NOT flaky
+        self::assertSame([], $result->flakyTests);
+    }
+
+    #[Test]
+    public function testFlakyListExcludesFinalSkippedTest(): void
+    {
+        $orch = $this->makeOrchestrator(retry: 2);
+
+        $cb = function (int $attempt, array $pending): AttemptOutcome {
+            if ($attempt === 1) {
+                $path = $this->writeJunit(
+                    'final-skipped-fail.xml',
+                    $this->failingJunit('SkippedCls', 'testSkippedAfterRetry'),
+                );
+
+                return $this->makeOutcome($attempt, [new SplFileInfo($path)], exitcode: 1);
+            }
+
+            $path = $this->writeJunit(
+                'final-skipped.xml',
+                $this->skippedJunit('SkippedCls', 'testSkippedAfterRetry'),
+            );
+
+            return $this->makeOutcome($attempt, [new SplFileInfo($path)]);
+        };
+
+        $result = $orch->orchestrate(['/p/test.php'], $cb);
+
+        self::assertCount(2, $result->allAttempts);
         self::assertSame([], $result->flakyTests);
     }
 

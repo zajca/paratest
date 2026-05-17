@@ -7,7 +7,6 @@ namespace ParaTest\WrapperRunner;
 use Generator;
 use ParaTest\Options;
 use PHPUnit\Event\Facade as EventFacade;
-use PHPUnit\Framework\ExecutionOrderDependency;
 use PHPUnit\Framework\Test;
 use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\TestSuite;
@@ -76,6 +75,8 @@ final readonly class SuiteLoader
      * @var array<string, list<string>>
      */
     public array $dependsMap;
+    /** @var array<string, non-empty-string> */
+    public array $testFileMap;
 
     public function __construct(
         private Options $options,
@@ -147,12 +148,14 @@ final readonly class SuiteLoader
 
         $this->testCount = count($testSuite);
 
-        $files      = [];
-        $tests      = [];
+        $files = [];
+        $tests = [];
         /** @var array<string, list<string>> $directDeps */
         $directDeps = [];
         /** @var array<string, bool> $knownKeys */
-        $knownKeys  = [];
+        $knownKeys = [];
+        /** @var array<string, non-empty-string> $testFileMap */
+        $testFileMap = [];
         foreach ($this->loadFiles($testSuite) as $file => $test) {
             $files[$file] = null;
 
@@ -182,9 +185,10 @@ final readonly class SuiteLoader
             // Pass 1 — direct `@depends` edges.
             // Key = "Class::method" of the dependent test. PHPT and `DataProviderTestSuite`
             // nodes are skipped above / traversed by loadFiles; they don't participate in @depends.
-            $key             = $test::class . '::' . $test->name();
-            $knownKeys[$key] = true;
-            $edges           = [];
+            $key               = $test::class . '::' . $test->name();
+            $knownKeys[$key]   = true;
+            $testFileMap[$key] = $file;
+            $edges             = [];
             foreach ($test->requires() as $dependency) {
                 if (! $dependency->isValid()) {
                     continue;
@@ -210,7 +214,8 @@ final readonly class SuiteLoader
             $directDeps[$key] = $edges;
         }
 
-        $this->dependsMap = $this->buildDependsMap($directDeps, $knownKeys);
+        $this->dependsMap  = $this->buildDependsMap($directDeps, $knownKeys);
+        $this->testFileMap = $testFileMap;
 
         $this->tests = $this->options->functional
             ? $tests
@@ -282,8 +287,6 @@ final readonly class SuiteLoader
      * `"::ClassName"` are expanded here to every known key with a matching
      * `"ClassName::"` prefix.
      *
-     *
-     *
      * @param array<string, list<string>> $directDeps
      * @param array<string, bool>         $knownKeys
      *
@@ -332,7 +335,7 @@ final readonly class SuiteLoader
 
             // Iterative DFS: stack entries carry (currentKey, iteratorIndex, ancestors-so-far).
             /** @var list<array{0: string, 1: int, 2: list<string>}> $stack */
-            $stack          = [[$startKey, 0, []]];
+            $stack            = [[$startKey, 0, []]];
             $state[$startKey] = 1;
 
             while ($stack !== []) {
@@ -358,8 +361,8 @@ final readonly class SuiteLoader
                     continue;
                 }
 
-                $child      = $children[$idx];
-                $top[1]     = $idx + 1;
+                $child  = $children[$idx];
+                $top[1] = $idx + 1;
                 unset($top);
 
                 if (isset($result[$child])) {

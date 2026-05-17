@@ -7,8 +7,10 @@ namespace ParaTest\JUnit;
 use SplFileInfo;
 
 use function array_keys;
+use function array_values;
 use function count;
 use function in_array;
+use function ksort;
 use function max;
 use function sort;
 
@@ -85,27 +87,38 @@ final readonly class LogMerger
      *
      * @param array<int, list<SplFileInfo>> $perAttemptJunitFiles attempt (1-based) => per-worker JUnit files
      */
-    public function mergeAcrossAttempts(array $perAttemptJunitFiles): ?TestSuite
+    public function mergeAcrossAttempts(array $perAttemptJunitFiles, bool $includeRetryMetadata = true): ?TestSuite
     {
         if ($perAttemptJunitFiles === []) {
             return null;
         }
 
-        $finalAttempt = max(array_keys($perAttemptJunitFiles));
-        $finalSuite   = $this->merge($perAttemptJunitFiles[$finalAttempt]);
-        if ($finalSuite === null) {
-            return null;
+        $finalAttempt   = max(array_keys($perAttemptJunitFiles));
+        $attemptNumbers = array_keys($perAttemptJunitFiles);
+        sort($attemptNumbers);
+
+        $effectiveSuite = null;
+        foreach ($attemptNumbers as $attemptNumber) {
+            $attemptSuite = $this->merge($perAttemptJunitFiles[$attemptNumber]);
+            if ($attemptSuite === null) {
+                continue;
+            }
+
+            $effectiveSuite = $effectiveSuite === null
+                ? $attemptSuite
+                : $this->mergeLatestCases($effectiveSuite, $attemptSuite);
+        }
+
+        if ($effectiveSuite === null || ! $includeRetryMetadata) {
+            return $effectiveSuite;
         }
 
         /** @var array<string, bool> $finalPassedByKey */
         $finalPassedByKey = [];
-        $this->indexFinalCases($finalSuite, $finalPassedByKey);
+        $this->indexFinalCases($effectiveSuite, $finalPassedByKey);
 
         /** @var array<string, list<TestCaseWithMessage>> $priorFailuresByKey */
         $priorFailuresByKey = [];
-
-        $attemptNumbers = array_keys($perAttemptJunitFiles);
-        sort($attemptNumbers);
 
         foreach ($attemptNumbers as $attemptNumber) {
             if ($attemptNumber === $finalAttempt) {
@@ -118,18 +131,118 @@ final readonly class LogMerger
             }
 
             $this->collectPriorFailures($priorSuite, $finalPassedByKey, $priorFailuresByKey);
-
-            // Drop the prior attempt's TestSuite tree before loading the next one
-            // to keep memory bounded. Small TestCaseWithMessage payloads remain
-            // referenced by $priorFailuresByKey.
-            unset($priorSuite);
         }
 
         if ($priorFailuresByKey === []) {
-            return $finalSuite;
+            return $effectiveSuite;
         }
 
-        return $this->decorateSuite($finalSuite, $priorFailuresByKey);
+        return $this->decorateSuite($effectiveSuite, $priorFailuresByKey);
+    }
+
+    private function mergeLatestCases(TestSuite $base, TestSuite $latest): TestSuite
+    {
+        if ($base->name !== $latest->name) {
+            $base   = $this->wrapNamedSuite($base);
+            $latest = $this->wrapNamedSuite($latest);
+        }
+
+        $suites = $base->suites;
+        foreach ($latest->suites as $name => $latestSuite) {
+            $suites[$name] = isset($suites[$name])
+                ? $this->mergeLatestCases($suites[$name], $latestSuite)
+                : $latestSuite;
+        }
+
+        ksort($suites);
+
+        /** @var array<string, TestCase> $casesByKey */
+        $casesByKey = [];
+        foreach ($base->cases as $case) {
+            $casesByKey[$this->caseKey($case)] = $case;
+        }
+
+        foreach ($latest->cases as $case) {
+            $casesByKey[$this->caseKey($case)] = $case;
+        }
+
+        return $this->recountSuite(
+            $base->name,
+            $base->file,
+            $suites,
+            array_values($casesByKey),
+        );
+    }
+
+    private function wrapNamedSuite(TestSuite $suite): TestSuite
+    {
+        if ($suite->name === '') {
+            return $suite;
+        }
+
+        return new TestSuite(
+            '',
+            $suite->tests,
+            $suite->assertions,
+            $suite->failures,
+            $suite->errors,
+            $suite->skipped,
+            $suite->time,
+            '',
+            [$suite->name => $suite],
+            [],
+        );
+    }
+
+    /**
+     * @param array<string, TestSuite> $suites
+     * @param list<TestCase>           $cases
+     */
+    private function recountSuite(string $name, string $file, array $suites, array $cases): TestSuite
+    {
+        $tests      = count($cases);
+        $assertions = 0;
+        $failures   = 0;
+        $errors     = 0;
+        $skipped    = 0;
+        $time       = 0.0;
+
+        foreach ($cases as $case) {
+            $assertions += $case->assertions;
+            $time       += $case->time;
+
+            if (! $case instanceof TestCaseWithMessage) {
+                continue;
+            }
+
+            match ($case->xmlTagName) {
+                MessageType::failure => ++$failures,
+                MessageType::error => ++$errors,
+                MessageType::skipped => ++$skipped,
+            };
+        }
+
+        foreach ($suites as $suite) {
+            $tests      += $suite->tests;
+            $assertions += $suite->assertions;
+            $failures   += $suite->failures;
+            $errors     += $suite->errors;
+            $skipped    += $suite->skipped;
+            $time       += $suite->time;
+        }
+
+        return new TestSuite(
+            $name,
+            $tests,
+            $assertions,
+            $failures,
+            $errors,
+            $skipped,
+            $time,
+            $file,
+            $suites,
+            $cases,
+        );
     }
 
     /** @param array<string, bool> $finalPassedByKey */
@@ -140,7 +253,7 @@ final readonly class LogMerger
         }
 
         foreach ($suite->cases as $case) {
-            $key = $case->class . '::' . $case->name;
+            $key = $this->caseKey($case);
             // A case "passed" in the final attempt iff its emission in that attempt
             // carried no failure/error message (TestCaseWithMessage with failure/error).
             $finalPassedByKey[$key] = ! $this->isRetriableDefect($case);
@@ -172,7 +285,7 @@ final readonly class LogMerger
                 continue;
             }
 
-            $key = $case->class . '::' . $case->name;
+            $key = $this->caseKey($case);
             // Only retain prior failures whose counterpart survived into the final
             // attempt's merged tree — otherwise we'd have nothing to attach to.
             if (! isset($finalPassedByKey[$key])) {
@@ -199,7 +312,7 @@ final readonly class LogMerger
         /** @var list<TestCase> $cases */
         $cases = [];
         foreach ($suite->cases as $case) {
-            $key = $case->class . '::' . $case->name;
+            $key = $this->caseKey($case);
             if (! isset($priorFailuresByKey[$key])) {
                 $cases[] = $case;
                 continue;
@@ -244,5 +357,10 @@ final readonly class LogMerger
         }
 
         return in_array($case->xmlTagName, [MessageType::failure, MessageType::error], true);
+    }
+
+    private function caseKey(TestCase $case): string
+    {
+        return $case->class . '::' . $case->name;
     }
 }

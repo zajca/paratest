@@ -4,13 +4,19 @@ declare(strict_types=1);
 
 namespace ParaTest\Tests\Unit\WrapperRunner;
 
+use InvalidArgumentException;
 use ParaTest\RunnerInterface;
 use ParaTest\Tests\TestBase;
 use ParaTest\WrapperRunner\WorkerCrashedException;
 use PHPUnit\Framework\Attributes\CoversNothing;
 
+use function extension_loaded;
 use function file_get_contents;
+use function getenv;
+use function putenv;
 use function simplexml_load_string;
+use function str_contains;
+use function substr_count;
 
 use const DIRECTORY_SEPARATOR;
 
@@ -39,12 +45,16 @@ final class WrapperRunnerRetryTest extends TestBase
 
     protected function tearDown(): void
     {
-        foreach ([
-            'PARATEST_RETRY_COUNTER_FILE',
-            'PARATEST_RETRY_CHAIN_COUNTER_FILE',
-            'PARATEST_RETRY_DP_COUNTER_FILE',
-            'PARATEST_RETRY_PHPT_COUNTER_FILE',
-        ] as $var) {
+        foreach (
+            [
+                'PARATEST_RETRY_COUNTER_FILE',
+                'PARATEST_RETRY_CHAIN_COUNTER_FILE',
+                'PARATEST_RETRY_CROSS_FILE_COUNTER_FILE',
+                'PARATEST_RETRY_DP_COUNTER_FILE',
+                'PARATEST_RETRY_MIXED_COUNTER_FILE',
+                'PARATEST_RETRY_PHPT_COUNTER_FILE',
+            ] as $var
+        ) {
             putenv($var);
             unset($_ENV[$var], $_SERVER[$var]);
         }
@@ -176,10 +186,10 @@ final class WrapperRunnerRetryTest extends TestBase
      */
     public function testRetryOnFilterExcludesSkipped(): void
     {
-        $this->bareOptions['path']         = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'AlwaysFailsTest.php');
-        $this->bareOptions['--retry']      = '2';
-        $this->bareOptions['--retry-on']   = 'failure,error';
-        $this->bareOptions['--processes']  = '1';
+        $this->bareOptions['path']        = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'AlwaysFailsTest.php');
+        $this->bareOptions['--retry']     = '2';
+        $this->bareOptions['--retry-on']  = 'failure,error';
+        $this->bareOptions['--processes'] = '1';
 
         $result = $this->runRunner();
 
@@ -198,10 +208,10 @@ final class WrapperRunnerRetryTest extends TestBase
         $this->bareOptions['path']        = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'AlwaysFailsTest.php');
         $this->bareOptions['--processes'] = '1';
 
-        $resultNoFlag   = $this->runRunner();
+        $resultNoFlag = $this->runRunner();
 
         $this->bareOptions['--retry'] = '0';
-        $resultRetryZero = $this->runRunner();
+        $resultRetryZero              = $this->runRunner();
 
         self::assertSame($resultNoFlag->exitCode, $resultRetryZero->exitCode);
         // Without retry flag there is no "Flaky tests" section; --retry=0 must also omit it.
@@ -214,10 +224,10 @@ final class WrapperRunnerRetryTest extends TestBase
      */
     public function testStopOnFailureDisablesRetry(): void
     {
-        $this->bareOptions['path']               = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'AlwaysFailsTest.php');
-        $this->bareOptions['--retry']            = '2';
-        $this->bareOptions['--stop-on-failure']  = true;
-        $this->bareOptions['--processes']        = '1';
+        $this->bareOptions['path']              = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'AlwaysFailsTest.php');
+        $this->bareOptions['--retry']           = '2';
+        $this->bareOptions['--stop-on-failure'] = true;
+        $this->bareOptions['--processes']       = '1';
 
         $result = $this->runRunner();
 
@@ -338,15 +348,44 @@ final class WrapperRunnerRetryTest extends TestBase
     {
         $this->setCounterEnv('PARATEST_RETRY_DP_COUNTER_FILE', $this->counterFile);
 
-        $this->bareOptions['path']              = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'DataProviderFlakyTest.php');
-        $this->bareOptions['--retry']           = '2';
-        $this->bareOptions['--functional']      = true;
-        $this->bareOptions['--max-batch-size']  = '1';
-        $this->bareOptions['--processes']       = '1';
+        $junitFile = $this->tmpDir . DIRECTORY_SEPARATOR . 'data-provider-retry.xml';
+
+        $this->bareOptions['path']             = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'DataProviderFlakyTest.php');
+        $this->bareOptions['--retry']          = '2';
+        $this->bareOptions['--functional']     = true;
+        $this->bareOptions['--log-junit']      = $junitFile;
+        $this->bareOptions['--max-batch-size'] = '1';
+        $this->bareOptions['--processes']      = '1';
 
         $result = $this->runRunner();
 
         self::assertSame(RunnerInterface::SUCCESS_EXIT, $result->exitCode);
+        self::assertStringContainsString('OK (3 tests,', $result->output);
+
+        $content = file_get_contents($junitFile);
+        self::assertNotFalse($content);
+        $xml = simplexml_load_string($content);
+        self::assertNotFalse($xml);
+
+        $testCases = $xml->xpath('//testcase');
+        self::assertIsArray($testCases);
+        self::assertCount(3, $testCases);
+    }
+
+    public function testFailOnSkippedIncludesNonRetriedSkipFromFirstAttempt(): void
+    {
+        $this->setCounterEnv('PARATEST_RETRY_MIXED_COUNTER_FILE', $this->counterFile);
+
+        $this->bareOptions['path']              = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'MixedSkippedAndFlakyTest.php');
+        $this->bareOptions['--retry']           = '2';
+        $this->bareOptions['--functional']      = true;
+        $this->bareOptions['--fail-on-skipped'] = true;
+        $this->bareOptions['--processes']       = '1';
+
+        $result = $this->runRunner();
+
+        self::assertSame(RunnerInterface::FAILURE_EXIT, $result->exitCode);
+        self::assertStringContainsString('Skipped: 1', $result->output);
     }
 
     /**
@@ -366,6 +405,67 @@ final class WrapperRunnerRetryTest extends TestBase
 
         self::assertSame(RunnerInterface::SUCCESS_EXIT, $result->exitCode);
         self::assertStringContainsString('DependsChainTest::testB', $result->output);
+    }
+
+    public function testRetryChainRetriesCrossFileAncestor(): void
+    {
+        $this->setCounterEnv('PARATEST_RETRY_CROSS_FILE_COUNTER_FILE', $this->counterFile);
+
+        $this->bareOptions['path']        = $this->fixture('retry_cross_file');
+        $this->bareOptions['--retry']     = '2';
+        $this->bareOptions['--processes'] = '1';
+
+        $result = $this->runRunner();
+
+        self::assertSame(RunnerInterface::SUCCESS_EXIT, $result->exitCode);
+        self::assertStringContainsString(
+            "Retry attempt 2/3: re-running 2 of 2 tests.\n"
+            . '  - ParaTest\Tests\fixtures\retry_cross_file\DependsProducerTest::testProducer' . "\n"
+            . '  - ParaTest\Tests\fixtures\retry_cross_file\DependsConsumerFlakyTest::testConsumer',
+            $result->output,
+        );
+        self::assertStringNotContainsString('Skipped:', $result->output);
+        self::assertStringContainsString('Flaky tests (1):', $result->output);
+    }
+
+    public function testTeamcityRetryReplaysServiceMessagesWhenRunStopsBeforeMaxAttempts(): void
+    {
+        $this->setCounterEnv('PARATEST_RETRY_COUNTER_FILE', $this->counterFile);
+
+        $this->bareOptions['path']        = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'FlakyCounterTest.php');
+        $this->bareOptions['--retry']     = '2';
+        $this->bareOptions['--teamcity']  = true;
+        $this->bareOptions['--processes'] = '1';
+
+        $result = $this->runRunner();
+
+        self::assertSame(RunnerInterface::SUCCESS_EXIT, $result->exitCode);
+        self::assertStringContainsString('##teamcity[testSuiteStarted', $result->output);
+        self::assertStringContainsString('##teamcity[testStarted', $result->output);
+        self::assertStringContainsString('##teamcity[testFinished', $result->output);
+        self::assertStringNotContainsString('##teamcity[testFailed', $result->output);
+    }
+
+    public function testTeamcityLogRetryWritesEffectiveResultOnce(): void
+    {
+        $this->setCounterEnv('PARATEST_RETRY_COUNTER_FILE', $this->counterFile);
+
+        $teamcityFile = $this->tmpDir . DIRECTORY_SEPARATOR . 'retry.teamcity';
+
+        $this->bareOptions['path']           = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'FlakyCounterTest.php');
+        $this->bareOptions['--retry']        = '2';
+        $this->bareOptions['--log-teamcity'] = $teamcityFile;
+        $this->bareOptions['--processes']    = '1';
+
+        $result = $this->runRunner();
+
+        self::assertSame(RunnerInterface::SUCCESS_EXIT, $result->exitCode);
+
+        $content = file_get_contents($teamcityFile);
+        self::assertNotFalse($content);
+        self::assertStringNotContainsString('##teamcity[testFailed', $content);
+        self::assertSame(1, substr_count($content, '##teamcity[testStarted'));
+        self::assertSame(1, substr_count($content, '##teamcity[testFinished'));
     }
 
     /**
@@ -415,7 +515,7 @@ final class WrapperRunnerRetryTest extends TestBase
         $this->bareOptions['--retry']     = '11';
         $this->bareOptions['--processes'] = '1';
 
-        $this->expectException(\InvalidArgumentException::class);
+        $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessageMatches('/--retry must be between 0 and 10/');
 
         $this->runRunner();

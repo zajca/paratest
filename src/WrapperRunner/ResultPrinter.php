@@ -59,10 +59,7 @@ final class ResultPrinter
      * attempts' TeamCity events would otherwise stream to stdout twice (once
      * during attempt 1, again during the retry), confusing IDE parsers that do
      * not tolerate duplicate `testStarted` for the same test name.
-     * Toggled on by `WrapperRunner::runAttempt()` for non-final attempts;
-     * final-attempt events are streamed normally.
-     *
-     *
+     * Toggled on by `WrapperRunner::runAttempt()` while retry orchestration is active.
      */
     private bool $suppressTeamcityStdout = false;
 
@@ -110,8 +107,7 @@ final class ResultPrinter
 
     /**
      * Controls whether live TeamCity (stdout) events are emitted during
-     * {@see self::printFeedback()}. See {@see $suppressTeamcityStdout} and
-     * .
+     * {@see self::printFeedback()}.
      */
     public function setSuppressTeamcityStdout(bool $suppress): void
     {
@@ -173,7 +169,18 @@ final class ResultPrinter
         SplFileInfo $outputFile,
         SplFileInfo|null $teamcityFile
     ): void {
-        if ($this->options->needsTeamcity && $teamcityFile !== null) {
+        if (
+            $this->options->configuration->outputIsTeamCity()
+            && $this->suppressTeamcityStdout
+        ) {
+            return;
+        }
+
+        if (
+            $this->options->needsTeamcity
+            && $teamcityFile !== null
+            && ! $this->suppressTeamcityStdout
+        ) {
             $teamcityProgress = $this->tailMultiple([$teamcityFile]);
 
             if ($this->teamcityLogFileHandle !== null) {
@@ -213,7 +220,7 @@ final class ResultPrinter
     /**
      * @param list<SplFileInfo>                                $teamcityFiles
      * @param array<class-string, TestDoxTestResultCollection> $testdoxResults
-     * @param list<string>                                     $flakyTests `"Class::method"` entries; only read when `--retry>0`.
+     * @param list<string>                                     $flakyTests     `"Class::method"` entries; only read when `--retry>0`.
      */
     public function printResults(
         TestResult $testResult,
@@ -295,7 +302,6 @@ final class ResultPrinter
 
         // R4 — Flaky tests summary. Emitted only when --retry>0 so output is
         // bit-identical to pre-retry behavior on the default (retry=0) path.
-        //
         if ($this->options->retry <= 0) {
             return;
         }

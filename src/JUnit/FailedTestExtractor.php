@@ -6,6 +6,7 @@ namespace ParaTest\JUnit;
 
 use SplFileInfo;
 
+use function array_reverse;
 use function array_values;
 use function error_log;
 use function in_array;
@@ -29,29 +30,29 @@ final readonly class FailedTestExtractor
     private const string PHPT_CLASS = 'PHPUnit\\Runner\\Phpt\\TestCase';
 
     /**
-     * @param non-empty-list<MessageType> $retryOn    message types that trigger retry
-     * @param array<string, list<string>> $dependsMap transitive closure of @depends ancestors keyed by "Class::method"
+     * @param non-empty-list<MessageType>     $retryOn     message types that trigger retry
+     * @param array<string, list<string>>     $dependsMap  transitive closure of @depends ancestors keyed by "Class::method"
+     * @param array<string, non-empty-string> $testFileMap source file for each "Class::method" key
      */
     public function __construct(
         private array $retryOn,
         private array $dependsMap,
-        private bool $functional
+        private bool $functional,
+        private array $testFileMap = [],
     ) {
     }
 
     /**
      * @param list<SplFileInfo> $junitFiles one attempt's per-worker JUnit files
      *
-     * @return list<non-empty-string> deduplicated work items ready to feed runAttempt()
+     * @return list<non-empty-string>
      */
     public function extractFailures(array $junitFiles): array
     {
         return $this->extractFailureDetails($junitFiles)->workItems;
     }
 
-    /**
-     * @param list<SplFileInfo> $junitFiles one attempt's per-worker JUnit files
-     */
+    /** @param list<SplFileInfo> $junitFiles one attempt's per-worker JUnit files */
     public function extractFailureDetails(array $junitFiles): RetryFailures
     {
         /** @var array<string, non-empty-string> $workItems */
@@ -71,30 +72,48 @@ final readonly class FailedTestExtractor
         }
 
         foreach ($failedByKey as $key => $case) {
-            if ($this->emitWorkItem($case, $workItems)) {
-                $this->emitTestName($case, $testNames);
-            }
-
             // Close under the transitive @depends ancestor map.
-            $ancestors = $this->dependsMap[$key] ?? [];
-            foreach ($ancestors as $ancestorKey) {
-                if (isset($failedByKey[$ancestorKey])) {
-                    // already emitted
-                    continue;
-                }
+            $this->emitAncestorWorkItems($key, $case, $failedByKey, $workItems, $testNames);
 
-                $ancestorCase = $this->synthesizeAncestorCase($ancestorKey, $case);
-                if ($ancestorCase === null) {
-                    continue;
-                }
-
-                if ($this->emitWorkItem($ancestorCase, $workItems)) {
-                    $this->emitTestName($ancestorCase, $testNames);
-                }
+            if (! $this->emitWorkItem($case, $workItems)) {
+                continue;
             }
+
+            $this->emitTestName($case, $testNames);
         }
 
         return new RetryFailures(array_values($workItems), array_values($testNames));
+    }
+
+    /**
+     * @param array<string, TestCase>         $failedByKey
+     * @param array<string, non-empty-string> $workItems
+     * @param array<string, non-empty-string> $testNames
+     */
+    private function emitAncestorWorkItems(
+        string $key,
+        TestCase $case,
+        array $failedByKey,
+        array &$workItems,
+        array &$testNames
+    ): void {
+        $ancestors = array_reverse($this->dependsMap[$key] ?? []);
+        foreach ($ancestors as $ancestorKey) {
+            if (isset($failedByKey[$ancestorKey])) {
+                continue;
+            }
+
+            $ancestorCase = $this->synthesizeAncestorCase($ancestorKey, $case);
+            if ($ancestorCase === null) {
+                continue;
+            }
+
+            if (! $this->emitWorkItem($ancestorCase, $workItems)) {
+                continue;
+            }
+
+            $this->emitTestName($ancestorCase, $testNames);
+        }
     }
 
     /** @param array<string, TestCase> $failedByKey */
@@ -198,9 +217,7 @@ final readonly class FailedTestExtractor
     /**
      * Builds a synthetic TestCase for an @depends ancestor keyed "Class::method".
      * Because the ancestor itself may not appear in the current attempt's failing
-     * set (e.g., it passed or wasn't included at all), we inherit $file from the
-     * triggering failed case as a best-effort pointer — non-functional mode only
-     * uses $file, functional mode only uses $class + $name.
+     * set, SuiteLoader provides its source file when it is known.
      */
     private function synthesizeAncestorCase(string $ancestorKey, TestCase $from): ?TestCase
     {
@@ -215,10 +232,12 @@ final readonly class FailedTestExtractor
             return null;
         }
 
+        $file = $this->testFileMap[$ancestorKey] ?? $from->file;
+
         return new TestCase(
             $name,
             $class,
-            $from->file,
+            $file,
             0,
             0,
             0.0,
