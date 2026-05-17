@@ -46,8 +46,18 @@ final readonly class FailedTestExtractor
      */
     public function extractFailures(array $junitFiles): array
     {
+        return $this->extractFailureDetails($junitFiles)->workItems;
+    }
+
+    /**
+     * @param list<SplFileInfo> $junitFiles one attempt's per-worker JUnit files
+     */
+    public function extractFailureDetails(array $junitFiles): RetryFailures
+    {
         /** @var array<string, non-empty-string> $workItems */
         $workItems = [];
+        /** @var array<string, non-empty-string> $testNames */
+        $testNames = [];
         /** @var array<string, TestCase> $failedByKey */
         $failedByKey = [];
 
@@ -61,7 +71,9 @@ final readonly class FailedTestExtractor
         }
 
         foreach ($failedByKey as $key => $case) {
-            $this->emitWorkItem($case, $workItems);
+            if ($this->emitWorkItem($case, $workItems)) {
+                $this->emitTestName($case, $testNames);
+            }
 
             // Close under the transitive @depends ancestor map.
             $ancestors = $this->dependsMap[$key] ?? [];
@@ -76,11 +88,13 @@ final readonly class FailedTestExtractor
                     continue;
                 }
 
-                $this->emitWorkItem($ancestorCase, $workItems);
+                if ($this->emitWorkItem($ancestorCase, $workItems)) {
+                    $this->emitTestName($ancestorCase, $testNames);
+                }
             }
         }
 
-        return array_values($workItems);
+        return new RetryFailures(array_values($workItems), array_values($testNames));
     }
 
     /** @param array<string, TestCase> $failedByKey */
@@ -116,25 +130,25 @@ final readonly class FailedTestExtractor
      *
      * @param array<string, non-empty-string> $workItems
      */
-    private function emitWorkItem(TestCase $case, array &$workItems): void
+    private function emitWorkItem(TestCase $case, array &$workItems): bool
     {
         $file = $case->file;
         if ($file === '') {
-            return;
+            return false;
         }
 
         // PHPT cases always map to a bare filename regardless of mode.
         if ($case->class === self::PHPT_CLASS) {
             $workItems[$file] = $file;
 
-            return;
+            return true;
         }
 
         if (! $this->functional) {
             // Non-functional mode re-runs the whole file (§2.5).
             $workItems[$file] = $file;
 
-            return;
+            return true;
         }
 
         // H3 — guard against embedded null bytes in the JUnit name attribute
@@ -146,12 +160,39 @@ final readonly class FailedTestExtractor
                 $case->name,
             ));
 
-            return;
+            return false;
         }
 
         $pcre             = sprintf('/%s$/', preg_quote($case->name, '/'));
         $item             = sprintf("%s\0%s", $file, $pcre);
         $workItems[$item] = $item;
+
+        return true;
+    }
+
+    /** @param array<string, non-empty-string> $testNames */
+    private function emitTestName(TestCase $case, array &$testNames): void
+    {
+        $testName = $this->displayName($case);
+        if ($testName === null) {
+            return;
+        }
+
+        $testNames[$testName] = $testName;
+    }
+
+    /** @return non-empty-string|null */
+    private function displayName(TestCase $case): ?string
+    {
+        if ($case->class === self::PHPT_CLASS) {
+            return $case->name !== '' ? $case->name : ($case->file !== '' ? $case->file : null);
+        }
+
+        if ($case->class !== '' && $case->name !== '') {
+            return $case->class . '::' . $case->name;
+        }
+
+        return $case->name !== '' ? $case->name : null;
     }
 
     /**

@@ -125,6 +125,39 @@ final class WrapperRunnerRetryTest extends TestBase
         self::assertStringContainsString('FlakyCounterTest::testFlakyPassesOnSecondAttempt', $result->output);
     }
 
+    public function testRetryProgressNeverExceedsOneHundredPercent(): void
+    {
+        $this->setCounterEnv('PARATEST_RETRY_COUNTER_FILE', $this->counterFile);
+
+        $this->bareOptions['path']        = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'FlakyCounterTest.php');
+        $this->bareOptions['--retry']     = '2';
+        $this->bareOptions['--processes'] = '1';
+
+        $result = $this->runRunner();
+
+        self::assertSame(RunnerInterface::SUCCESS_EXIT, $result->exitCode);
+        self::assertStringContainsString('Retry attempt 2/3', $result->output);
+        self::assertDoesNotMatchRegularExpression('/\((?:10[1-9]|1[1-9][0-9]|[2-9][0-9]{2,})%\)/', $result->output);
+    }
+
+    public function testRetryAttemptPrintsRetriedTestName(): void
+    {
+        $this->setCounterEnv('PARATEST_RETRY_COUNTER_FILE', $this->counterFile);
+
+        $this->bareOptions['path']        = $this->fixture('retry' . DIRECTORY_SEPARATOR . 'FlakyCounterTest.php');
+        $this->bareOptions['--retry']     = '2';
+        $this->bareOptions['--processes'] = '1';
+
+        $result = $this->runRunner();
+
+        self::assertSame(RunnerInterface::SUCCESS_EXIT, $result->exitCode);
+        self::assertStringContainsString(
+            "Retry attempt 2/3: re-running 1 of 1 test.\n"
+            . '  - ParaTest\Tests\fixtures\retry\FlakyCounterTest::testFlakyPassesOnSecondAttempt',
+            $result->output,
+        );
+    }
+
     /**
      * SC-4: The default --retry-on=failure,error must NOT retry skipped tests.
      * Running a test that always skips with --retry=2 must produce a single

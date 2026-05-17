@@ -222,6 +222,10 @@ final class WrapperRunner implements RunnerInterface
      */
     private function runAttempt(int $attempt, array $pending): AttemptOutcome
     {
+        if ($attempt > 1) {
+            $this->printer->resetProgress();
+        }
+
         // Reset per-attempt state. Cross-attempt bookkeeping is preserved.
         $this->pending               = $pending;
         $this->exitcode              = -1;

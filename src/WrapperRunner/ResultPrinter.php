@@ -102,6 +102,12 @@ final class ResultPrinter
         $this->totalCases = $testCount;
     }
 
+    public function resetProgress(): void
+    {
+        $this->column         = 0;
+        $this->casesProcessed = 0;
+    }
+
     /**
      * Controls whether live TeamCity (stdout) events are emitted during
      * {@see self::printFeedback()}. See {@see $suppressTeamcityStdout} and

@@ -6,6 +6,7 @@ namespace ParaTest\Tests\Unit\JUnit;
 
 use ParaTest\JUnit\FailedTestExtractor;
 use ParaTest\JUnit\MessageType;
+use ParaTest\JUnit\RetryFailures;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\TestCase;
 use SplFileInfo;
@@ -20,6 +21,7 @@ use function uniqid;
 
 /** @internal */
 #[CoversClass(FailedTestExtractor::class)]
+#[CoversClass(RetryFailures::class)]
 final class FailedTestExtractorTest extends TestCase
 {
     private string $tmpDir;
@@ -206,6 +208,34 @@ XML;
         // Two failures in the same file in non-functional mode must produce exactly one item
         self::assertCount(1, $result);
         self::assertSame([$testFile], $result);
+    }
+
+    public function testExtractFailureDetailsIncludesDisplayNamesForRetriedTests(): void
+    {
+        $testFile = '/path/to/ExampleTest.php';
+        $xml      = <<<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="ExampleTest" tests="2" failures="2" errors="0" skipped="0" assertions="2" time="0.002" file="{$testFile}">
+    <testcase name="testOne" class="ExampleTest" file="{$testFile}" line="10" assertions="1" time="0.001">
+      <failure type="PHPUnit\Framework\AssertionFailedError">First failure</failure>
+    </testcase>
+    <testcase name="testTwo" class="ExampleTest" file="{$testFile}" line="20" assertions="1" time="0.001">
+      <failure type="PHPUnit\Framework\AssertionFailedError">Second failure</failure>
+    </testcase>
+  </testsuite>
+</testsuites>
+XML;
+        $file      = $this->writeJunit($xml);
+        $extractor = new FailedTestExtractor([MessageType::failure], [], false);
+
+        $result = $extractor->extractFailureDetails([$file]);
+
+        self::assertSame([$testFile], $result->workItems);
+        self::assertSame([
+            'ExampleTest::testOne',
+            'ExampleTest::testTwo',
+        ], $result->testNames);
     }
 
     public function testExtractFailuresIncludesAncestorsViaDependsMap(): void

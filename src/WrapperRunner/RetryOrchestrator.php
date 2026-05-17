@@ -11,6 +11,7 @@ use ParaTest\JUnit\TestSuite as JUnitTestSuite;
 use ParaTest\Options;
 use RuntimeException;
 use SplFileInfo;
+use Symfony\Component\Console\Formatter\OutputFormatter;
 use Symfony\Component\Console\Output\OutputInterface;
 
 use function count;
@@ -82,7 +83,8 @@ final class RetryOrchestrator
                 break;
             }
 
-            $nextPending = $this->extractor->extractFailures($outcome->junitFiles);
+            $failures    = $this->extractor->extractFailureDetails($outcome->junitFiles);
+            $nextPending = $failures->workItems;
             if ($nextPending === []) {
                 // Everyone passed — no more work. We stop early and do not
                 // archive this attempt's files (they are the final-attempt
@@ -98,6 +100,9 @@ final class RetryOrchestrator
                 $this->suiteLoader->testCount,
                 count($nextPending) === 1 ? '' : 's',
             ));
+            foreach ($failures->testNames as $testName) {
+                $this->output->writeln(sprintf('  - %s', OutputFormatter::escape($testName)));
+            }
 
             // Archive this (non-final) attempt's artifacts into {tmpDir}/attempt-N/
             // and mutate the AttemptOutcome's SplFileInfo lists to reflect the
