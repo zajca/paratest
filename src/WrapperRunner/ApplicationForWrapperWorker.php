@@ -17,7 +17,6 @@ use PHPUnit\Runner\CodeCoverage;
 use PHPUnit\Runner\DeprecationCollector\Facade as DeprecationCollector;
 use PHPUnit\Runner\ErrorHandler;
 use PHPUnit\Runner\Extension\ExtensionBootstrapper;
-use PHPUnit\Runner\Extension\ExtensionFacade;
 use PHPUnit\Runner\Extension\PharLoader;
 use PHPUnit\Runner\Filter\Factory;
 use PHPUnit\Runner\ResultCache\DefaultResultCache;
@@ -155,7 +154,10 @@ final class ApplicationForWrapperWorker
                 );
             }
 
-            $extensionFacade       = new ExtensionFacade();
+            $extensionFacadeClass  = class_exists('PHPUnit\Runner\Extension\ExtensionFacade')
+                ? 'PHPUnit\Runner\Extension\ExtensionFacade'
+                : 'PHPUnit\Runner\Extension\Facade';
+            $extensionFacade       = new $extensionFacadeClass();
             $extensionBootstrapper = new ExtensionBootstrapper(
                 $this->configuration,
                 $extensionFacade,

@@ -11,7 +11,6 @@ use PHPUnit\Framework\Test;
 use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\TestSuite;
 use PHPUnit\Runner\Extension\ExtensionBootstrapper;
-use PHPUnit\Runner\Extension\ExtensionFacade;
 use PHPUnit\Runner\Extension\PharLoader;
 use PHPUnit\Runner\Phpt\TestCase as PhptTestCase;
 use PHPUnit\Runner\ResultCache\DefaultResultCache;
@@ -39,6 +38,7 @@ use function array_unique;
 use function array_values;
 use function assert;
 use function ceil;
+use function class_exists;
 use function count;
 use function is_int;
 use function is_string;
@@ -98,7 +98,10 @@ final readonly class SuiteLoader
                 );
             }
 
-            $extensionFacade       = new ExtensionFacade();
+            $extensionFacadeClass  = class_exists('PHPUnit\Runner\Extension\ExtensionFacade')
+                ? 'PHPUnit\Runner\Extension\ExtensionFacade'
+                : 'PHPUnit\Runner\Extension\Facade';
+            $extensionFacade       = new $extensionFacadeClass();
             $extensionBootstrapper = new ExtensionBootstrapper(
                 $this->options->configuration,
                 $extensionFacade,
